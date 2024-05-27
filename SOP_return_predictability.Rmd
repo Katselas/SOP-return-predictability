@@ -1,0 +1,2032 @@
+---
+author: "Hongyi Xu - Stockholm School of Economics"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: journal
+    toc: yes 
+    toc_float: true 
+    code_folding: "hide"
+  word_document:
+    toc: yes
+params:
+  market_file: "PredictorDataDK_NYSEm.csv" # file for the market portfolio 
+  port_file: "PredictorDataDK_NYSEm_szbm6.csv" # file for the characteristic-based portfolios 
+  rfree_file: "FF_Rfree_Apr18_2024.csv" # file for the risk free rate 
+always_allow_html: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+setwd("The folder location for raw data.")
+
+library(tidyverse)
+library(zoo)
+library(ggplot2)
+library(plotly)
+library(psych)
+library(xtable)
+library(gt)
+library(tseries)
+library(knitr)
+library(DT)
+library(openxlsx) # combine data into xlsx files 
+
+list.files()
+```
+
+## Data cleaning and Preparation
+
+```{r step0, echo=TRUE}
+timestamp() 
+
+# 0. record datasets ----
+## 0.1 initial value setup ----
+freq = 12 # the frequency of the data <- 12 for monthly; 4 for quarterly; 1 for annually
+start.ym = as.yearmon(1966) -1/12 # the starting time
+end.ym = as.yearmon(2024) - 1/12 # the ending time 
+negativevalue = 'remove' # what should we do with the negative values? 
+if (negativevalue == 'remove') cat("Negative earnings are deleted.") 
+
+month_select <- function(freq = freq) { # return the months for different time frequency
+  if (freq == 12) {
+    return(c("January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November","December"))
+  }
+  if (freq == 4) {
+    return(c("March", "June", "September", "December")) 
+  }
+  if (freq == 1) {
+    return("December")
+  }
+}
+freq_name <- function(freq = freq) {
+  if (freq == 12) {
+    return("monthly")
+  }
+  if (freq == 4) {
+    return("quarterly") 
+  }
+  if (freq == 1) {
+    return("annual")
+  }
+}
+
+## 0.2 preliminary data cleaning ---- 
+cat(paste("Selected month:", paste(month_select(freq = freq), collapse = ", ")), sep = "")
+#### for the market portfolio 
+port_market <- read.csv(params$market_file) %>% 
+  as_tibble() %>% 
+  mutate(month = as.yearmon(as.Date(date, format = "%Y-%m-%d")), 
+         vwret = rollsumr(log(1+vwret), 12/freq, NA) ) %>% # converted into the log returns. 
+  filter(if (negativevalue == 'remove') E12 >= 0 else TRUE) %>% 
+  mutate(E12 = ((E12*(E12 >= 0) + 0.001*(E12 < 0))) ) %>% 
+  filter(months(month) %in% month_select(freq = freq)) %>% 
+  filter(month <= end.ym) 
+
+plot(y = port_market$E12, x = port_market$month, type = "b"); abline(h = 0, col = 'red', lty = 2)
+
+write.csv(x = port_market, file = "market_Allfirms.csv")
+
+#### for characteristic-based portfolios 
+ports_all <- read.csv(params$port_file) %>% 
+  as_tibble() 
+
+ports <- unique(ports_all$port) # identifiers for portfolios
+for (p in ports) {
+  ports.dt <- ports_all %>%
+    filter(port == p) %>% 
+    select(-port) %>% 
+    mutate(month = as.yearmon(as.Date(date, format = "%Y-%m-%d"))) %>% 
+    arrange(month) %>% 
+    mutate(vwret = rollsumr(log(1+vwret), 12/freq, NA) ) %>% 
+    filter(if (negativevalue == 'remove') E12 >= 0 else TRUE) %>% 
+    mutate(E12 = ((E12*(E12 >= 0) + 0.001*(E12 < 0))) ) %>% 
+    filter(months(month) %in% month_select(freq = freq)) %>% 
+    filter(month <= end.ym) 
+  
+  write.csv(x = ports.dt, file = paste("port_", p, ".csv", sep = ""))
+}
+
+## 0.3 name portfolios and predictors ----
+market.names <- list.files(pattern = "market_")[1]
+data.names <- list.files(pattern = "^port_") # data for portfolios
+id.names <- c("Market", ports) # set plot names
+ratio_names <- c("DP", "PE", "EY", "DY", "Payout") # potential predictors
+
+## 0.4 risk-free rate ----- 
+RF <- read.csv(params$rfree_file) %>% # record the risk free rate
+  as_tibble() %>% # as the average of the bid and ask.
+  mutate(month = as.yearmon( gsub("(\\d{4})(\\d{2})$","\\1-\\2", month) ) ) %>%
+  filter(months(month) %in% month_select(freq = freq)) %>%
+  filter(month <= end.ym) %>%
+  rename(t30ret = RF) %>% 
+  mutate(t30ret = t30ret * 0.01)
+```
+
+---
+title: "JEF Paper Coding (2024) - v5.0 NYSE only (For `r str_to_title(freq_name(freq = freq))` Data - `r str_split(str_split(params$port_file, pattern = "_", n =2)[[1]][2], pattern = "\\.")[[1]][1]`)"
+---
+
+## Figure 1 - Log Cumulative Index
+
+Log cumulative realised portfolio return components for seven portfolios - the market portfolio and six size and book-to-market equity ratio sorted portfolios. All following figures demonstrate the `r freq_name(freq = freq)` realized price-earnings ratio growth (*gm*), earnings growth (*ge*), dividend-price (*dp*) and the portfolio return index (*r*) with the values in January 1966 as zero for all portfolios.
+
+### Log Cumulative Index {.tabset}
+
+```{r figure1.output, echo=TRUE, results='asis'}
+# TABLE-1. summary statistics ----
+TABLE1.uni <- list() # the univariate statistics
+TABLE1.cor <- list() # the correlation matrixs
+
+month.dt <- seq(filter(select(port_market, month), month >= start.ym)$month[2],
+                end.ym, 1/freq) 
+DP.df <- EY.df <- PE.df <- data.frame(month = month.dt)
+
+## (1*) summary tables for Summary stats & Correlations ----
+for (c in 1:7) {
+  id <- c(market.names, data.names)[c]
+  
+  ## 1. read the data ---- 
+  data_nyse <- read.csv(id) %>%
+    as_tibble() %>%
+    mutate(month = as.yearmon(month)) %>% 
+    filter(month >= start.ym) %>% 
+    select(month, r = vwret, P = Index, E = E12, D = D12, pe_raw = PE) %>% 
+    mutate(DP = D / P, 
+           PE = P / E,
+           EP = E / P,
+           EY = E / lag(P), # earnings yield
+           DY = D / lag(P), # dividend yield
+           Payout = D / E) # payout ratios
+  
+  PE.df <- PE.df %>% 
+    left_join(select(data_nyse, month, PE), by = 'month')
+  EY.df <- EY.df %>% 
+    left_join(select(data_nyse, month, EY), by = 'month')
+  DP.df <- DP.df %>% 
+    left_join(select(data_nyse, month, DP), by = 'month')
+  
+  ## 2. return decomposition ----
+  data_decompose <- data_nyse %>% 
+    mutate(r = r, # cts returns = log total returns 
+           gm = log(PE) - lag(log(PE)), # multiple expansion rate
+           ge = log(E) - lag(log(E)), # earnings growth rate
+           dp = log(1 + DP/freq)) %>% 
+    na.omit()
+  
+  ## 3. summary-Stat ----
+  ar1.coef <- function(x) {
+    return(as.numeric(lm(x ~ lag(x))$coefficients[2]))
+  } # return the function value of the coefficient for the AR(1) model
+  
+  comp_summary.dt <- data_decompose %>%
+    select(gm, ge, dp, r) %>%  
+    describe() %>%
+    mutate(mean = mean * 100,
+           sd = sd * 100,
+           median = median * 100,
+           min = min * 100,
+           max = max * 100) %>%
+    select(Mean = mean, Median = median, SD = sd, Min = min, Max = max, Skew = skew, Kurt = kurtosis) %>%
+    round(digits = 4)
+  
+  comp_summary.dt$"AR(1)" <- data_decompose %>%
+    select(gm, ge, dp, r) %>%
+    apply(2, ar1.coef) %>%
+    round(digits = 4)
+  
+  ### Store the summary stat
+  # print(paste("Data starts from ", first(data_decompose$month), " and ends in ", last(data_decompose$month), ".", sep = ""))
+  TABLE1.uni[[id.names[c]]] <- comp_summary.dt
+  
+  ## 4. correlations ----
+  comp_cor <- data_decompose %>% select(gm, ge, dp, r) %>% cor()
+  TABLE1.cor[[id.names[c]]] <- comp_cor
+  
+  # Figure-1. cumulative realised return components ---- 
+  cat('\n')
+  cat('#### ', id.names[c], '   \n')
+  cat('\n')
+  
+  # jpeg(filename = paste("Figure1_", id.names[c], ".jpeg", sep = ""), width = 550, height = 350)
+  par(mar = c(2, 4, 2, 1)) 
+  cum_components.ts <- data.frame(month = month.dt) %>% 
+    left_join(data_decompose, by = 'month') %>%
+    select(r, gm, ge, dp) %>% 
+    apply(2, FUN = function(x) cumsum(ifelse(is.na(x), 0, x) ) + x*0 ) %>% 
+    ts(start = month.dt[1], frequency = freq)
+  plot.ts(cum_components.ts, plot.type = "single", lty = 1:4, main = id.names[c], cex.main = 1, 
+          xlab = NULL, ylab = "Cumulative Return and Components Indices")
+  legend("topleft",
+         legend = c("Total return", "Price earnings growth",
+                    "Earnings growth", "Dividend price"),
+         lty = 1:4,
+         cex = 1.0) # text size
+  # dev.off()
+  par(mar = c(5, 4, 4, 2) + 0.1) 
+  cat('\n')
+
+} 
+
+# write.csv(TABLE1.uni, file = "table_1.uni.csv")
+# write.csv(TABLE1.cor, file = "table_1.cor.csv")
+```
+
+`r print(paste("Data starts from ", first(data_decompose$month), " and ends in ", last(data_decompose$month), sep = ""))`.
+
+## Table 1 - Summary statistics of returns components 
+
+```{r table1.output, echo=T}
+## summary data for table1
+rowname <- rep(colnames(TABLE1.cor$Market), length(names(TABLE1.uni)))
+portname = rep(names(TABLE1.uni), each = length(colnames(TABLE1.cor$Market)))
+
+table1 <- do.call(rbind.data.frame, TABLE1.uni) %>% 
+  cbind.data.frame(do.call(rbind.data.frame, TABLE1.cor)) %>%
+  round(digits = 2) %>%
+  cbind.data.frame(rowname, portname)
+
+## give the table 1 outputs
+gt(data = table1, rowname_col = "rowname", groupname_col = "portname") %>%
+  tab_header(title = "Table 1 - Summary statistics of returns components",
+             subtitle = paste(freq_name(freq = freq), " data starts from ", first(data_decompose$month), " and ends in ", last(data_decompose$month), ".", sep = "")) %>%
+  tab_spanner(label = "Panel A: univariate statistics",
+              columns = c(Mean, Median, SD, Min, Max, Skew, Kurt, "AR(1)")) %>%
+  tab_spanner(label = "Panel B: Correlations",
+              columns = c(gm, ge, dp, r)) %>%
+  tab_source_note(source_note = html("Note: Panel A in this table presents mean, median, standard deviation (SD), minimum, maximum, skewness (Skew), kurtosis (kurt) and first-order autocorrelation coefficient of the realised components of stock market returns and six size and book-to-market equity ratio sorted portfolios. These univariate statistics for each portfolios are presented separately. gm is the continuously compounded growth rate in the price-earnings ratio. ge is the continuously compounded growth rate in earnings. dp is the log of one plus the dividend-price ratio. r is the portfolio returns. Panel B in this table reports correlation matrices for all seven portfolios. The sample period starts from Feburary 1966 and ends in December 2019."))
+```
+
+## Figure 3 - Cumulative OOS R-sqaure Difference and Cumulative SSE Difference
+
+Note:
+
+-   "SOP_c" here is for the constrained SOP predictions.
+
+### Cumulative OOS R-sqaure Difference and Cumulative SSE Difference {.tabset}
+
+```{r figure3.output, echo=T, results='asis'}
+# TABLE-2. different tables OOS R-square ----
+TABLE2 <- TABLE2.sop_mg <- TABLE2.sop_mgshrink <- list()
+table2.df <- table2.sop_mg.df <- table2.sop_mgshrink.df <- data.frame()
+
+CSSE.ls <- list() 
+
+## (3*) repeat for each portfolio ----
+c <- 0
+for (id in c(market.names, data.names)) {
+  c <- c + 1
+  # print(id); print(id.names[c])
+  cat('\n') 
+  cat('#### ', id.names[c], '   \n')
+  
+  ## 1. read the data ----
+  data_nyse <- read.csv(id) %>% 
+    as.tbl() %>%
+    mutate(month = as.yearmon(month)) %>%
+    filter(month >= start.ym) %>% # start from "Dec 1965"
+    select(month, r = vwret, P = Index, E = E12, D = D12) %>%
+    mutate(DP = D / P, # construct predictors
+           PE = P / E,
+           EP = E / P,
+           EY = E / lag(P), # earnings yield
+           DY = D / lag(P), # dividend yield
+           Payout = D / E) # payout ratios
+  
+  ## 2. return decomposition ----
+  k = freq * 20 # set a 20-year rolling window (total k periods.)
+  
+  data_decompose <- data_nyse %>% # also try PD ratio replacing PE.
+    mutate(r = r, # cts returns (has already being the log return in row 95)
+           gm = log(PE) - lag(log(PE)), # multiple expansion rate
+           ge = log(E) - lag(log(E)), # earnings growth rate 
+           dp = log(1 + DP/freq)) %>% 
+    na.omit() %>% 
+    left_join(select(data_nyse, month, Ek = E) %>% mutate(month = month + k/freq), by = 'month' ) %>% 
+    mutate(mu_ge0 = (log(E) - log(Ek)) / k ) 
+  
+  ## 3. SOP predictions ---- 
+  if (nrow(data_decompose) > k) {
+    data_pred <- data_decompose %>%
+      select(month, r, gm, ge, dp, mu_ge0) %>%
+      mutate(mu_gm = 0,
+             # mu_ge1 = rollmeanr(ge, k, fill = NA_real_), # rolling mean 
+             # mu_ge2 = c(rep(NA_real_, (k-1)), cummean(ge)[k:length(ge)]), # recursive mean
+             # mu_ge3 = cummean(ge), # recursive mean from the beginning 
+             # a_DK1 = rollmeanr(r - dp, k, fill = NA_real_), # methods Eq (14/15) by DK 
+             # a_DK2 = cummean(r - dp), # methods Eq (14/15) by DK 
+             mu_dp = dp,
+             mu_sop = mu_gm + mu_ge0 + mu_dp) %>% # the predictor > see note 2.
+      mutate(sop_simple = lag(mu_sop), # conditional predictions
+             hist_mean = lag(cummean(r)) ) # historical mean predictions
+    
+  ### 3.2 constrained SOP predictions ----- 
+    constrained_sop2 <- constrained_sop <- rep(NA_real_, nrow(data_decompose)) 
+    for (t in (k+2):nrow(data_decompose)) {
+      ## based on the Eq (14/15) in F-SC (2011) 
+      x.IS <- data_decompose$dp[1:(t-2)] 
+      y.IS <- data_decompose$r[2:(t-1)] 
+      intercept <- data_pred$mu_ge1[t-1] #?
+      y <- y.IS - intercept 
+      data.IS <- data.frame(y, x.IS)
+      
+      model_constrained <- lm(y ~ x.IS - 1 + offset(1*x.IS), data = data.IS)
+      model.IS <- glm(y ~ x.IS - 1, data = data.IS, family = gaussian(link = "identity"), offset = -1*x.IS)
+      # mm <- glm.fit(x = x.IS, y = y, offset = -1*x.IS, intercept = F); mm$coefficients
+      
+      x.new <- data_decompose$dp[t-1] 
+      y.pred <- predict.glm(model.IS, newdata = data.frame(x.IS = x.new), type = "response")
+      # coef_constrained <- coef(model.IS) - 1 # the true coefficient estimate 
+      y.pred_manual <- coef(model.IS) * x.new 
+      constrained_sop[t] <- y.pred + intercept # store the prediction
+      constrained_sop2[t] <- y.pred_manual + intercept # store the prediction
+    }
+    data_pred$sop_constrained <- constrained_sop
+    data_pred$sop_constrained2 <- constrained_sop2
+  
+  } else {
+    data_pred <- data_decompose %>%
+      select(month, r, gm, ge, dp, mu_ge0) %>%
+      mutate(mu_sop = NA, 
+             sop_simple = NA, # conditional predictions
+             hist_mean = lag(cummean(r)) ) # historical mean predictions
+    
+    data_pred$sop_constrained2 <- data_pred$sop_constrained <- NA
+  }
+  
+  ## 4. OOS R2 and MSE-F ----
+  ### build the function for the bootstrap
+  Boot_MSE.F <- function(data, actual, cond, uncond, x, critical.values = TRUE, boot.times = 10000) {
+    ## clean and reorganise the data
+    ports.dt <- data %>%
+      select(month, actual = actual, cond = cond, uncond = uncond, x = x)
+    
+    if ( nrow(filter(ports.dt, !is.na(actual) & !is.na(cond) & !is.na(uncond))) == 0 ) {
+      return(NULL)
+    } else {
+      ports.dt_narm <- ports.dt %>% # select(-x) %>% 
+        filter(!is.na(actual) & !is.na(cond) & !is.na(uncond)) %>% 
+        # na.omit() %>%
+        mutate(error_A = actual - cond,
+               error_N = actual - uncond,
+               Cuml_MSE_A = cummean(error_A ^ 2),
+               Cuml_MSE_N = cummean(error_N ^ 2),
+               Cuml_OOS.rsquared = 1 - Cuml_MSE_A / Cuml_MSE_N,
+               Cum_SSE = cumsum(error_N ^2 - error_A ^ 2) ) %>% 
+        right_join(data.frame(month = seq(.$month[1], end.ym - 1/12, 1/freq) ), by = 'month') %>% 
+        arrange(desc(-month))
+      # ports.dt_narm %>% filter(month > 2009 & month < 2010.5)
+      ### for the full (out-of-)sample
+      MSE_A <- mean(ports.dt_narm$error_A ^ 2, na.rm = T)
+      MSE_N <- mean(ports.dt_narm$error_N ^ 2, na.rm = T)
+      OOS_r.squared <- 1 - MSE_A / MSE_N # out-of-sample R square
+      MSE_F <- length(na.omit(ports.dt_narm)$month) * (MSE_N - MSE_A) / (MSE_A) 
+      MAE_A <- mean(abs(ports.dt_narm$error_A), na.rm = T) %>% round(digits = 6) # Mean absolute error of the conditional model
+      print(paste("OOS R Squared: ", round(OOS_r.squared, digits = 4), sep = ""))
+      print(paste("MSE-F: ", round(MSE_F, digits = 4), sep = ""))
+      
+      Cuml_OOS.ts <- ts(ports.dt_narm$Cuml_OOS.rsquared, start = ports.dt_narm$month[1], frequency = freq)
+      Cum_SSE.ts <- ts(ports.dt_narm$Cum_SSE, start = ports.dt_narm$month[1], frequency = freq)
+      
+      ## Bootstrapped MSE-F Stat
+      if (critical.values == TRUE) {
+        ## get the data series for x and y
+        y0 <- ports.dt[is.na(ports.dt$cond), ]$actual
+        y1 <- ports.dt[!is.na(ports.dt$cond), ]$actual
+        x1 <- as.vector(na.omit(ports.dt$x))
+        
+        ## full sample estimation for the model
+        alpha <- mean(y1)
+        u1 <- y1 - alpha
+        
+        x.lm <- lm(x1 ~ lag(x1))
+        mu <- as.numeric(coef(x.lm)[1])
+        rho <- as.numeric(coef(x.lm)[2])
+        u2 <- as.numeric(x.lm$residuals)
+        
+        u <- data.frame(index = 1:length(u1), u1, u2) # the dataset storing all the residual info
+        
+        ### bootstrapping pairs of error terms
+        boot.critical <- c()
+        for (i in 1:boot.times) { # the bootstrapped times can be modified
+          index.boot <- sample(u$index, length(u1), replace = T)
+          u.boot <- data.frame()
+          for (j in index.boot) {
+            u.boot <- rbind.data.frame(u.boot, u[j,])
+          } # record the bootstrapped error terms
+          
+          ### reconstruct the simulated x and y
+          y1.new <- alpha + u.boot$u1
+          x0.new <- sample(x1, 1) # resample a value as the starting value of x
+          x1.new <- c(mu + rho * x0.new + u.boot$u2[1])
+          for (j in 2:length(y1.new)) {
+            x1.new[j] <- mu + x1.new[j-1] * rho + u.boot$u2[j]
+          } # simulate SOP values
+          
+          ### redo the rolling estimation
+          y.boot <- c(y0, y1.new)
+          x.boot <- c(rep(NA_real_, (length(y0) - 1)), x0.new, x1.new)
+          
+          data.dt <- data.frame(month = ports.dt$month, x.boot, y.boot) %>%
+            as.tbl() %>%
+            mutate(conditional = lag(x.boot), # convert to the SOP prediction
+                   unconditional = lag(cummean(y.boot))) %>% # convert to the historical mean prediction
+            na.omit()
+          
+          error_N.boot = data.dt$y.boot - data.dt$unconditional
+          error_A.boot = data.dt$y.boot - data.dt$conditional
+          MSE_N.boot = mean(error_N.boot ^ 2) 
+          MSE_A.boot = mean(error_A.boot ^ 2) 
+          OOS_r.squared.boot <- 1 - MSE_A.boot / MSE_N.boot %>% round(digits = 6) # out-of-sample R square
+          
+          ### MSE-F statistic
+          MSE_F.boot <- length(error_N.boot) * (MSE_N.boot - MSE_A.boot) / (MSE_A.boot) %>% round(digits = 6)
+          
+          boot.critical[i] <- MSE_F.boot
+          
+          if (i %% (boot.times/10) == 0) {
+            timestamp()
+            print(paste("SOP", ": ", i %/% (boot.times/100), "%", sep = ""))
+          }
+        }
+        ## store the results
+        result <- cbind.data.frame(IS_r.squared = NA_real_,
+                                   IS_pval = NA_real_, # in-sample p.value
+                                   OOS_r.squared,
+                                   MAE_A, # MAE of conditional model
+                                   MSE_F,
+                                   t(quantile(boot.critical, probs = c(0.90, 0.95, 0.99))),
+                                   p.value = mean(boot.critical > MSE_F))
+        # d_RMSE = round(d_RMSE, digits = 4),
+        # DM_stat = round(DM_test.result$statistic, digits = 4),
+        # DM_pval = round(DM_test.result$p.value, digits = 4))
+      } else {
+        result <- cbind.data.frame(IS_r.squared = NA_real_,
+                                   IS_pval = NA_real_, # in-sample p.value
+                                   OOS_r.squared,
+                                   MAE_A, # MAE of conditional model
+                                   MSE_F)
+      }
+      
+      rownames(result) <- "SOP"
+      output <- list(result = result, Cuml_OOS.ts = Cuml_OOS.ts, Cum_SSE.ts = Cum_SSE.ts)
+      return(output)
+    }
+    
+  }
+  
+  ### store the results for the SOP method
+  cat("SOP: ")
+  sop.result <- Boot_MSE.F(data = data_pred, actual = "r", cond = "sop_simple", uncond = "hist_mean", x = "mu_sop", critical.values = FALSE, boot.times = 3000)
+  sop.result$result 
+  cat('\n')
+  
+  cat("SOP_c: ")
+  sop_constrained.result <- Boot_MSE.F(data = data_pred, actual = "r", cond = "sop_constrained", uncond = "hist_mean", x = "mu_sop", critical.values = FALSE, boot.times = 3000)
+  sop_constrained.result$result
+  cat('\n')
+  
+  # sop_constrained2.result <- Boot_MSE.F(data = data_pred, actual = "r", cond = "sop_constrained2", uncond = "hist_mean", x = "mu_sop", critical.values = FALSE, boot.times = 3000)
+  # sop_constrained.result$result
+  
+  cat('\n')
+  par(mfrow = c(2,1))
+    par(mar = c(3,5,3,2))
+  Cuml_OOS.sop.ts <- ts.intersect(sop.result$Cuml_OOS.ts * 100, sop_constrained.result$Cuml_OOS.ts * 100) 
+  plot.ts(Cuml_OOS.sop.ts, 
+          plot.type = 'single', lty = c(1,3), col = c(1,'blue'), 
+          xlab = NULL, ylab = "as %", main = paste(id.names[c], ": Cumulative OOS R Squared Difference - SOP", sep = "")) 
+  abline(h = c(0,1), lty = 2, col = 2)
+  abline(v = c(2003,2007), lty = 2, col = 2)
+  
+    par(mar = c(5,5,3,2))
+  Cuml_SSE.sop.ts <- ts.intersect(sop.result$Cum_SSE.ts, sop_constrained.result$Cum_SSE.ts) 
+  plot.ts(Cuml_SSE.sop.ts, 
+          plot.type = 'single', lty = c(1,3), col = c(1,'blue'), 
+          ylab = NULL, cex.lab = 0.5, 
+          xlab = "An increase in a line indicates better performance of the conditional model\n *The blue dotted line is for the constrained SOP",
+          main = paste(id.names[c], ": Cumulative SSE Difference - SOP", sep = "")) 
+  abline(h = 0, lty = 2, col = 2)
+  abline(v = c(2003,2008), lty = 2, col = 2)
+  par(mfrow = c(1,1))
+  
+  cat('\n') 
+  
+  ### store all cumulative OOS R2 difference values
+  Cuml_all.ts <- sop.result$Cuml_OOS.ts * 100
+  Csse_all.ts <- sop.result$Cum_SSE.ts
+  
+  ## 5. univariate predictive regressions ----
+  table2.uni_predictors <- data.frame()
+  cat('\n') 
+  ### 5.1 also add the multiple growth forecast regressions w/o shrinkage (2024-May-01): 
+  table2.sop_mg <- data.frame()
+  table2.sop_mgshrink <- data.frame()
+  
+  for (predictor in ratio_names) {
+    ## construct conditional & unconditional predictions
+    data_univariate <- data_decompose %>% 
+      select(month, r, predictor, gm, ge, dp) %>%
+      mutate(hist_mean = lag(cummean(r)),
+             x = lag(get(predictor)) %>% log) ## convert to log predictors
+      # data_univariate[[predictor]] <- log(data_univariate[[predictor]])
+      # data_univariate[["x"]] <- log(data_univariate[["x"]])
+    
+    ## IS R2
+    lm.IS <- lm(r ~ x, data = data_univariate)
+    IS_r.squared <- summary(lm.IS)$r.squared # in-sample r squared
+    IS_pval <- summary(lm.IS)$coefficients[2,4] # the p-value from F-statistic
+    
+    ## OOS recursive window predictions
+    k <- k # the starting in-sample data
+    i <- 1200 # The shrinkage intensity i can be thought of as the weight given to the prior of no predictability. It is measured in units of time periods. default: i = 1,200
+    con_pred <- sop_mg <- sop_mg_shrink <- rep(NA_real_, nrow(data_univariate))
+    
+    for (t in (k+2):nrow(data_univariate)) {
+      x.IS <- data_univariate$x[2:(t-1)]
+      y.IS <- data_univariate$r[2:(t-1)]
+      reg.IS <- lm(y.IS ~ x.IS)
+      
+      x.new <- data_univariate$x[t]
+      y.pred <- predict(reg.IS, newdata = data.frame(x.IS = x.new))
+      con_pred[t] <- y.pred # store the prediction
+      
+      ### multiple growth
+      gm.IS <- data_univariate$gm[2:(t-1)]
+      reg.MG <- lm(gm.IS ~ x.IS) # the multiple growth regression (without shrinkage)
+      
+      sop_mg[t] <- predict(reg.MG, newdata = data.frame(x.IS = x.new)) # store the prediction for multiple growth component
+      
+      ### applying shrinkage - assuming zero unconditional mean for multiple growth
+      beta.MG <- reg.MG$coefficients[2]
+      beta.shrink <- length(x.IS)/(length(x.IS)+i) * beta.MG
+      alpha.shrink <- - beta.shrink * mean(x.IS)
+      sop_mg_shrink[t] <- alpha.shrink + beta.shrink * x.new # store the prediction for multiple growth component after shrinkage 
+    }
+    
+    data_univariate <- data_univariate %>%
+      mutate(con_pred = con_pred,
+             mu_gm = sop_mg, # append different predictions
+             mu_gm_shrink = sop_mg_shrink) %>%
+      mutate(mu_ge = lag(rollmeanr(ge, k, fill = NA_real_)), # rolling mean 
+             mu_dp = lag(dp)) %>%
+      mutate(sop_mg = mu_gm + mu_ge + mu_dp, # extension 1.1
+             sop_mgshrink = mu_gm_shrink + mu_ge + mu_dp) # extension 1.2 with shrinkage 
+    
+    data_univariate
+    
+    ## generate SOP with multiple growth         
+    sop.result_mg <- Boot_MSE.F(data = data_univariate, actual = "r", cond = "sop_mg", uncond = "hist_mean", x = "NA", critical.values = FALSE, boot.times = 3000)$result %>%
+      `rownames<-`(predictor)
+    sop.result_mg_shrink <- Boot_MSE.F(data = data_univariate, actual = "r", cond = "sop_mgshrink", uncond = "hist_mean", x = "NA", critical.values = FALSE, boot.times = 3000)$result %>%
+      `rownames<-`(predictor)       
+    ## store results for multiple growth w/o shrinkage
+    table2.sop_mg <- rbind.data.frame(table2.sop_mg, sop.result_mg)
+    table2.sop_mgshrink <- rbind.data.frame(table2.sop_mgshrink, sop.result_mg_shrink)
+    
+    
+    ## Stat and Bootstrap
+    data = data_univariate
+    actual = "r"
+    cond = "con_pred"
+    uncond = "hist_mean"
+    critical.values = FALSE # decide whether the bootstrapped critical value is calculated > Note 3.
+    boot.times = 1000 * 10
+    
+    { 
+      cat('\n')
+      cat(paste(predictor, ": ")) 
+      ## get OOS R2 & MSE-F
+      ports.dt <- data %>%
+        select(month, actual = actual, cond = cond, uncond = uncond, predictor) %>%
+        rename(x = predictor)
+      
+      ports.dt_narm <- ports.dt %>% # select(-x) %>% 
+        filter(!is.na(actual) & !is.na(cond) & !is.na(uncond)) %>% 
+        # na.omit() %>%
+        mutate(error_A = actual - cond,
+               error_N = actual - uncond,
+               Cuml_MSE_A = cummean(error_A ^ 2),
+               Cuml_MSE_N = cummean(error_N ^ 2),
+               Cuml_OOS.rsquared = 1 - Cuml_MSE_A / Cuml_MSE_N,
+               Cum_SSE = cumsum(error_N ^2 - error_A ^ 2) ) %>% 
+        right_join(data.frame(month = seq(.$month[1], end.ym - 1/12, 1/freq) ), by = 'month') %>% 
+        arrange(desc(-month))
+      ### for the full (out-of-)sample
+      MSE_A <- mean(ports.dt_narm$error_A ^ 2, na.rm = T)
+      MSE_N <- mean(ports.dt_narm$error_N ^ 2, na.rm = T)
+      OOS_r.squared <- 1 - MSE_A / MSE_N # out-of-sample R square
+      MSE_F <- length(na.omit(ports.dt_narm)$month) * (MSE_N - MSE_A) / (MSE_A) 
+      MAE_A <- mean(abs(ports.dt_narm$error_A), na.rm = T) %>% round(digits = 6) # Mean absolute error of the conditional model
+      print(paste("IS R Squared: ", round(IS_r.squared, digits = 4), sep = ""))
+      print(paste("OOS R Squared: ", round(OOS_r.squared, digits = 4), sep = ""))
+      print(paste("MSE-F: ", round(MSE_F, digits = 4), sep = ""))
+      
+      ### combine the cumulative OOS R2 difference of other predictors & cum SSE
+      Cuml_pred.ts <- ts(ports.dt_narm$Cuml_OOS.rsquared * 100, start = ports.dt_narm$month[1], frequency = freq)
+      Cuml_all.ts <- ts.union(Cuml_all.ts, Cuml_pred.ts)
+      Cum_pred.sse <- ts(ports.dt_narm$Cum_SSE, start = ports.dt_narm$month[1], frequency = freq)
+      Csse_all.ts <- ts.union(Csse_all.ts, Cum_pred.sse)
+      
+      ## prepare the bootstrap
+      if (critical.values == TRUE) {
+        y0 <- ports.dt$actual[1]
+        y1 <- ports.dt$actual[-1]
+        x1 <- ports.dt$x
+        
+        ## full sample estimation for the model
+        alpha <- mean(y1)
+        u1 <- y1 - alpha
+        
+        x.lm <- lm(x1 ~ lag(x1))
+        mu <- as.numeric(coef(x.lm)[1])
+        rho <- as.numeric(coef(x.lm)[2])
+        u2 <- as.numeric(x.lm$residuals)
+        
+        u <- data.frame(index = 1:length(u1), u1, u2) # the dataset storing all the residual info
+        
+        ### bootstrap pairs of error terms
+        boot.critical <- c()
+        for (i in 1:boot.times) { # the bootstrapped times can be modified
+          index.boot <- sample(u$index, length(u1), replace = T)
+          u.boot <- data.frame()
+          for (j in index.boot) {
+            u.boot <- rbind.data.frame(u.boot, u[j,])
+          } # record the bootstrapped error terms
+          
+          ### reconstruct the simulated x and y
+          y1.new <- alpha + u.boot$u1
+          x0.new <- sample(x1, 1) # resample a value as the starting value of x
+          x1.new <- c(mu + rho * x0.new + u.boot$u2[1])
+          for (j in 2:length(y1.new)) {
+            x1.new[j] <- mu + x1.new[j-1] * rho + u.boot$u2[j]
+          } # simulate predictors
+          
+          ### redo the rolling estimation
+          y.boot <- c(y0, y1.new)
+          x.boot <- c(x0.new, x1.new)
+          
+          data.dt <- as.tbl(data.frame(month = ports.dt$month, x.boot, y.boot, x = lag(x.boot)))
+          con_pred = rep(NA_real_, nrow(data.dt))
+          for (t in (k+1):nrow(data.dt)) {
+            x.IS <- data.dt$x[2:(t-1)]
+            y.IS <- data.dt$y.boot[2:(t-1)]
+            reg.IS <- lm(y.IS ~ x.IS)
+            
+            x.new <- data.dt$x[t]
+            y.pred <- predict(reg.IS, newdata = data.frame(x.IS = x.new))
+            con_pred[t] <- y.pred
+          }
+          data.dt$conditional <- con_pred
+          data.dt <- data.dt %>%
+            mutate(unconditional = lag(cummean(y.boot))) %>%
+            na.omit()
+          
+          error_N.boot = data.dt$y.boot - data.dt$unconditional
+          error_A.boot = data.dt$y.boot - data.dt$conditional
+          MSE_N.boot = mean(error_N.boot ^ 2)
+          MSE_A.boot = mean(error_A.boot ^ 2)
+          OOS_r.squared.boot <- 1 - MSE_A.boot / MSE_N.boot # out-of-sample R square
+          
+          ### MSE-F statistic
+          MSE_F.boot <- length(error_N.boot) * (MSE_N.boot - MSE_A.boot) / (MSE_A.boot)
+          
+          boot.critical[i] <- MSE_F.boot
+          
+          if (i %% (boot.times/10) == 0) {
+            timestamp()
+            print(paste(predictor, ": ", i %/% (boot.times/100), "%", sep = ""))
+          }
+        }
+        ## store the results
+        result <- cbind.data.frame(IS_r.squared, 
+                                   IS_pval, # in-sample p.value
+                                   OOS_r.squared,
+                                   MAE_A, # MAE of conditional model
+                                   MSE_F,
+                                   t(quantile(boot.critical, probs = c(0.90, 0.95, 0.99))),
+                                   p.value = mean(boot.critical > MSE_F))
+        # d_RMSE = round(d_RMSE, digits = 4),
+        # DM_stat = round(DM_test.result$statistic, digits = 4),
+        # DM_pval = round(DM_test.result$p.value, digits = 4))
+      } else {
+        result <- cbind.data.frame(IS_r.squared, 
+                                   IS_pval, # in-sample p.value
+                                   OOS_r.squared,
+                                   MAE_A, # MAE of conditional model
+                                   MSE_F)
+      }
+      rownames(result) <- predictor
+      
+      result 
+      cat('\n')
+    }
+    
+    ## store the results for all predictors
+    table2.uni_predictors <- rbind.data.frame(table2.uni_predictors, result)
+  }
+  table2.uni_predictors
+  
+  ## 6. statistics summary ----
+  table2 <- rbind.data.frame(table2.uni_predictors, "SOP" = sop.result$result, "SOP_c" = sop_constrained.result$result) 
+  
+  ### 6.1 summary for SOP with multiple growth regressions w/o shrinkage
+  table2.sop_mg <- rbind.data.frame(table2.sop_mg, "SOP" = sop.result$result)
+  table2.sop_mgshrink <- rbind.data.frame(table2.sop_mgshrink, "SOP" = sop.result$result)
+  
+  if ("IS_pval" %in% colnames(table2)) {
+    table2$IS.star <- ifelse(is.na(table2$IS_pval), "", ifelse(table2$IS_pval <= 0.01, "***", ifelse(table2$IS_pval <= 0.05, "**", ifelse(table2$IS_pval <= 0.1, "*", "")))) 
+  }
+  # statistical significance from McCracken (2007)
+  table2$McCracken <- ifelse(table2$MSE_F >= 3.838, "***", ifelse(table2$MSE_F >= 1.599, "**", ifelse(table2$MSE_F >= 0.685, "*", "")))
+  table2.sop_mg$McCracken <- ifelse(table2.sop_mg$MSE_F >= 3.838, "***", ifelse(table2.sop_mg$MSE_F >= 1.599, "**", ifelse(table2.sop_mg$MSE_F >= 0.685, "*", "")))
+  table2.sop_mgshrink$McCracken <- ifelse(table2.sop_mgshrink$MSE_F >= 3.838, "***", ifelse(table2.sop_mgshrink$MSE_F >= 1.599, "**", ifelse(table2.sop_mgshrink$MSE_F >= 0.685, "*", "")))
+  
+  table2
+  TABLE2[[id.names[c]]] <- table2
+  TABLE2.sop_mg[[id.names[c]]] <- table2.sop_mg
+  TABLE2.sop_mgshrink[[id.names[c]]] <- table2.sop_mgshrink
+  
+  table2$rowname <- rownames(table2)
+  table2.sop_mg$rowname <- table2.sop_mgshrink$rowname <- rownames(table2.sop_mgshrink)
+  
+  table2$portname <- table2.sop_mg$portname <- table2.sop_mgshrink$portname <- id.names[c]
+  
+  table2.df <- rbind.data.frame(table2.df, table2)
+  table2.sop_mg.df <- rbind.data.frame(table2.sop_mg.df, table2.sop_mg)
+  table2.sop_mgshrink.df <- rbind.data.frame(table2.sop_mgshrink.df, table2.sop_mgshrink)
+  
+  ## 7. cumulative OOS R2 difference merged dataset ----
+  colnames(Cuml_all.ts) <- c("SOP", ratio_names)
+  cat('\n') 
+  par(mfrow = c(3,3))
+  for (method in colnames(Cuml_all.ts)) {
+    par(mar = c(2, 2.5, 2, 0.5))
+    plot.ts(window(Cuml_all.ts[, method], start = 1990), xlab = NULL, lty = 2, ylab = NULL, main = method, cex.main = 0.8, xaxt = "n", las = 2)
+    axis(1, seq(1990, 2020, by = 10), cex.axis = 0.8)
+  }
+  
+  colnames(Csse_all.ts) <- c("SOP", ratio_names)
+  par(mfrow = c(3,3))
+  for (method in colnames(Csse_all.ts)) {
+    par(mar = c(2, 2.5, 2, 0.5))
+    plot.ts(Csse_all.ts[, method], xlab = NULL, lty = 2, ylab = NULL, main = method, cex.main = 0.8, xaxt = "n", las = 2)
+    axis(1, seq(1990, 2020, by = 10), cex.axis = 0.8)
+  }
+  par(mfrow = c(1,1), mar = c(5, 4, 4, 2) + 0.1)
+  cat('\n')
+  
+  CSSE.ls[[id.names[c]]] <- Csse_all.ts # store the CSSE values
+}
+```
+
+## Table 2 - Forecasts of portfolio returns
+
+This table demonstrates the in-sample and out-of-sample R-squares for the market and six size and book-to-market equity ratio sorted portfolios from predictive regressions and the Sum-of-the-Parts method. IS R-squares are estimated using the whole sample period and the OOS R-squares are calculated compare the forecast error of the model against the historical mean model. The full sample period starts from Feb 1966 to December 2019 and the IS period is set to be 20 years with forecsats beginning in Feb 1986. The MSE-F statistics are calculated to test the hypothesis $H_0: \text{out-of-sample R-squares} = 0$ vs $H_1: \text{out-of-sample R-squares} \neq 0$.
+
+> Predictors here are all in log terms.
+
+```{r table2.output}
+gt(table2.df, rowname_col = "rowname", groupname_col = "portname") %>%
+  tab_header(title = "Table 2 - Forecasts of portfolio returns",
+             subtitle = paste("OOS ", freq_name(freq = freq), " data starts from ", first(data_decompose$month) + k/freq, " and ends in ", last(data_decompose$month), ".", sep = "")) %>%
+  fmt_number(columns = 1:4, decimals = 6, suffixing = TRUE)
+
+datatable(
+  table2.df, extensions = c('Buttons', 'ColReorder', 'FixedColumns'), options = list(
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel'), 
+    colReorder = TRUE, 
+    scrollX = TRUE,
+    fixedColumns = TRUE
+  )
+) 
+
+dt_present <- table2.df %>% 
+  select(OOS_r.squared, rowname, portname) %>% 
+  spread(key = portname, value = OOS_r.squared) 
+
+gt(dt_present[, c("rowname", id.names)], rowname_col = "rowname") %>% 
+  tab_header(title = "Table 2A - Forecasts of portfolio returns: OOS R2",
+             subtitle = paste(str_to_title(freq_name(freq = freq)), " data starts from ", first(data_decompose$month) + k/freq, " and ends in ", last(data_decompose$month), ".", sep = "")) %>%
+  fmt_percent(columns = 1:8, decimals = 2)
+
+# write.csv(table2.df, file = paste("Table2_", str_split(str_split(params$port_file, pattern = "_", n =2)[[1]][2], pattern = "\\.")[[1]][1], ".csv", sep = "") )
+```
+
+## Figure 4 - `r str_to_title(freq_name(freq = freq))` return predictions
+
+Here I only present the `r freq_name(freq = freq)` predictions of the historical mean model, the SOP method and the predictive regressions based on the dividend-price ratio and the earnings-price ratio.
+
+### Return Predictions {.tabset}
+
+```{r figure4a.ouptut, echo=T, results='asis'}
+# TABLE-3 optimal weights and CEGs ----
+all_predictions <- list() ## store all the prediction values
+# kpss.ts <- kpss.diff <- as.data.frame(matrix(nrow = 8, ncol = 7), col.names = c(market.names, data.names))
+c <- 0
+
+for (id in c(market.names, data.names)) {
+  c <- c + 1
+  # print(id); print(id.names[c])
+  cat('\n')
+  cat('#### ', id.names[c], '   \n')
+  
+  ## construct SOP predictions
+  data_nyse <- read.csv(id) %>%
+    as.tbl() %>%
+    mutate(month = as.yearmon(month)) %>%
+    filter(month >= start.ym) %>% # start from "Jan 1966"
+    select(month, r = vwret, P = Index, E = E12, D = D12) %>%
+    mutate(DP = D / P,
+           PE = P / E,
+           EP = E / P,
+           EY = E / lag(P), # earnings yield
+           DY = D / lag(P), # dividend yield
+           Payout = D / E) # payout ratios
+  
+  ## 2. return decomposition ----
+  k = freq * 20 # set a 20-year rolling window 
+  
+  data_decompose <- data_nyse %>% # also try PD ratio replacing PE.
+    mutate(r = r, # cts returns (has already being the log return in row 95)
+           gm = log(PE) - lag(log(PE)), # multiple expansion rate
+           ge = log(E) - lag(log(E)), # earnings growth rate
+           # mu_ge0 = (log(E) - lag(log(E), k)) / k,
+           dp = log(1 + DP/freq)) %>% 
+    na.omit() %>% 
+    left_join(select(data_nyse, month, Ek = E) %>% mutate(month = month + k/freq), by = 'month' ) %>% 
+    mutate(mu_ge0 = (log(E) - log(Ek)) / k ) 
+  
+  ## 3. SOP predictions ---- 
+  data_pred <- data_decompose %>%
+    select(month, r, gm, ge, dp, mu_ge0) %>%
+    mutate(mu_gm = 0,
+           mu_ge1 = rollmeanr(ge, k, fill = NA_real_), # rolling mean 
+           mu_ge2 = c(rep(NA_real_, (k-1)), cummean(ge)[k:length(ge)]), # recursive mean
+           mu_ge3 = cummean(ge), # recursive mean from the beginning 
+           a_DK1 = rollmeanr(r - dp, k, fill = NA_real_), # methods Eq (14/15) by DK 
+           a_DK2 = cummean(r - dp), # methods Eq (14/15) by DK 
+           mu_dp = dp,
+           mu_sop = mu_gm + mu_ge0 + mu_dp) %>% # the predictor > see note 2.
+    mutate(sop_simple = lag(mu_sop), # conditional predictions
+           hist_mean = lag(cummean(r)) ) # historical mean predictions
+  
+  all_predictions.dt <- data_pred %>% 
+    right_join(data.frame(month = seq(data_pred$month[1], end.ym - 1/12, 1/freq) ), by = 'month') %>% 
+    arrange(desc(-month)) %>% 
+    select(month, r, hist_mean, sop_simple) # store the prediction results
+  
+  ## construct univariate predictions
+  for (predictor in ratio_names) {
+    ## construct conditional & unconditional predictions
+    data_univariate <- data_decompose %>%
+      select(month, r, predictor) %>%
+      mutate(x = lag(get(predictor)) %>% log) %>%
+      select(-predictor)
+    
+    ## IS R2
+    lm.IS <- lm(r ~ x, data = data_univariate)
+    IS_r.squared <- summary(lm.IS)$r.squared # in-sample r squared
+    
+    ## OOS recursive window predictions
+    k <- k # the starting in-sample data
+    con_pred = rep(NA_real_, nrow(data_univariate))
+    for (t in (k+2):nrow(data_univariate)) {
+      x.IS <- data_univariate$x[2:(t-1)]
+      y.IS <- data_univariate$r[2:(t-1)]
+      reg.IS <- lm(y.IS ~ x.IS)
+      
+      x.new <- data_univariate$x[t]
+      y.pred <- predict(reg.IS, newdata = data.frame(x.IS = x.new))
+      con_pred[t] <- y.pred # store the prediction
+    }
+    data_univariate[[predictor]] <- con_pred
+    data_univariate # get the univariate predictions
+    
+    all_predictions.dt <- all_predictions.dt %>% # combine into all other estimations
+      left_join(select(data_univariate, month, predictor), by = "month")
+  }
+  
+  ## store all the predictions generated
+  all_predictions[[id.names[c]]] <- (all_predictions.dt)
+  names(all_predictions.dt)
+  
+ ## show the performance of variance predictions
+  cat('\n')
+  
+  p <- c("hist_mean", "sop_simple", "DP", "PE")
+  # all_predictions.ts <- na.omit(all_predictions.dt)
+  all_predictions.ts <- ts(all_predictions.dt[, -(1:2)], start = all_predictions.dt$month[1], frequency = freq) %>% 
+    window(start = as.numeric(start.ym + k/freq) )
+  plot.ts(all_predictions.ts[, p], plot.type = "single",  col = 1:length(p), xlab = NULL, ylab = paste(str_to_title(freq_name(freq = freq)), " Returns", sep = ""))
+  title(main = paste(id.names[c], ": ", freq_name(freq = freq), " return predictions", sep = ""))
+  legend(xpd = T, inset = -0.35, "bottom", legend = p, col = 1:length(p), lty = 1, horiz = T, cex = 0.8, bty = "n", lwd = 2)
+  cat('\n')
+}
+```
+
+## Figure 5 - Trading Performance (with no trading restrictions)
+
+-   Markowitz optimal weight on the risky portfolio using the SOP method and the historical mean model.
+-   Markowitz optimal weight on the risky portfolio using all models.
+-   Out-of-sample performance of the trading strategies - the SOP method, the historical mean model and the buy-and-hold strategy - with no trading restrictions.
+
+### Trading Performance {.tabset}
+
+```{r figure4.output, echo=T, results='asis'}
+## 8. calculate the CEGs ----
+TABLE3 <- list()
+TABLE4 <- list()
+
+table3.df <- data.frame()
+table4.df <- data.frame()
+
+#### create the folder storing the figure 3 
+dir.create(file.path(getwd(), "Figure3")) 
+
+##
+risk.coef <- 3 # the risk-aversion coefficient
+for (id in names(all_predictions)) {
+  all_predictions.dt <- all_predictions[[id]] %>% # read corresponding data
+    right_join(data.frame(month = seq(head(.$month, 1), tail(.$month, 1), 1/freq) ), by = 'month') %>% 
+    arrange(desc(-month))
+  cat('\n')
+  cat('#### ', id, '   \n') 
+  
+  var.s <- rep(NA_real_, length(all_predictions.dt$r))
+  for (t in 1:(length(var.s) - 1)) {
+    var.s[t+1] <- var(all_predictions.dt$r[1:t], na.rm = T) # calculate variance estimation
+  }
+  all_predictions.dt$var.s <- var.s # historical sample variance
+  all_predictions.dt <- all_predictions.dt %>%
+    left_join(RF, by = "month") %>%
+    rename(Rfree = t30ret) %>% # include the risk-free rate
+    mutate(Rfree = lag(Rfree)) # choose the lag of that rate
+  
+  ## obtain the optimal weights on risky portfolios
+  weights_stock <- all_predictions.dt
+  for (mu in c("r", "hist_mean", "sop_simple", ratio_names)) {
+    weights_stock[[mu]] <- (exp(weights_stock[[mu]]) - 1 - weights_stock[["Rfree"]]) / (risk.coef * weights_stock[["var.s"]])
+  } ## calculate the optimal weights
+  weights_stock[["buy_hold"]] <- 1 
+  
+  cat('\n')
+  ## plot the weights
+  plot.ts(ts(weights_stock$sop_simple, start = weights_stock$month[1], frequency = freq) %>% window(start = 1986), xlab = NULL, ylab = NULL, main = substitute(paste("The optimal weights on the ", name, " portfolio with ", gamma, " = ", g, sep = ""), list(name = id, g = risk.coef)))
+  lines(ts(weights_stock$hist_mean, start = weights_stock$month[1], frequency = freq), col = 2, lty = 3)
+  abline(h = c(0, 1, 1.5), col = "greY50", lty = 3)
+  legend("bottomright", legend = c("sop_simple", "hist_mean"), col = 1:2, lty = c(1,3), cex = 0.8)
+  
+  par(mar = c(5, 4, 3, 2))
+  plot.ts(ts(weights_stock[c("hist_mean", "sop_simple", ratio_names)],
+             start = weights_stock$month[1], frequency = freq) %>% window(start = 1986),
+          plot.type = "single", col = 1:length(c("hist_mean", "sop_simple", ratio_names)),
+          ylim = c(-1, 3), xlab = NULL, ylab = NULL)
+  abline(h = c(0, 1, 1.5), lty = 2, col = "grey50")
+  title(main = substitute(paste("The optimal weight on the ", name, " portfolio with ", gamma, " = ", g, sep = ""),
+                          list(name = id, g = risk.coef)))
+  legend(xpd = T, "bottom", inset = -0.28, lty = 1, lwd = 2, nc = 4, cex = 0.8, bty = "n",
+         legend = c("hist_mean", "sop_simpel", ratio_names),
+         col = 1:length(c("hist_mean", "sop_simpel", ratio_names))) 
+  
+  ## 8.1 calculate OOS trading performance ----
+  ## using upper and lower boundaries
+  rp <- all_predictions.dt %>%
+    select(month, r, Rfree) %>%
+    mutate(r = exp(r) - 1) # change from the log return back to the simple return
+  candidates <- list("Panel A: No Trading Restrictions" = list(F, 0, 0),
+                     "Panel B: Trading Restrictions 0 ~ 150%" = list(T, 1.5, 0),
+                     "Panel C: Trading Restrictions 0 ~ 100%" = list(T, 1, 0) )
+  for (i in names(candidates)) {
+    limit.para <- candidates[[i]]
+    limit.opt =  limit.para[[1]] # the option to set limit or not
+    limit.max <- limit.para[[2]] # the upper bound of the portfolio weight
+    limit.min <- limit.para[[3]] # the lower bound of the portfolio weight
+    
+    for (mu in c("hist_mean", "sop_simple", ratio_names, "buy_hold")) {
+      w <- weights_stock[[mu]]
+      if (limit.opt == TRUE) { # whether to pose a upper-lower bound
+        w[w > limit.max & !is.na(w)] <- limit.max
+        w[w < limit.min & !is.na(w)] <- limit.min
+      }
+      rp[[mu]] <- w * rp$r + (1 - w) * rp$Rfree # calculate the portfolio returns
+    } # 'rp' has the risky+rff trading portfolio returns
+    rp.na.omit <- na.omit(rp)
+    table3.mean <- apply((rp.na.omit[-1]), 2, FUN = function(x) mean(x, na.rm = T))
+    table3.var <- apply((rp.na.omit[-1]), 2, FUN = function(x) var(x, na.rm = T))
+    table3.cer <- table3.mean - 1/2 * risk.coef * table3.var # certainty equivalent returns
+    table3.dt <- cbind.data.frame(mean = table3.mean, 
+                                  variance = table3.var, 
+                                  CERs = table3.cer, 
+                                  CERs_annualised = table3.cer * freq,
+                                  CEGs_annualised = (table3.cer - table3.cer["hist_mean"]) * freq)
+    table3.dt
+    TABLE3[[id]] <- table3.dt
+    
+    table3.dt <- round(table3.dt, digits = 6)
+    table3.dt$rowname <- rownames(table3.dt)
+    table3.dt$portname <- id
+    table3.dt$type <- i
+    table3.df <- rbind.data.frame(table3.df, table3.dt) # for forming tables
+    # assign(paste("table3.df_", i, sep = ""), table3.df)
+    
+    if (nrow(na.omit(rp)) > 0) {
+      pfm <- na.omit(rp) %>% # simulate its performance
+        mutate(buyhold = cumprod(1 + r),
+               index.hm = cumprod(1 + hist_mean),
+               index.sop = cumprod(1 + sop_simple)) %>% 
+        right_join(data.frame(month = seq(rp$month[1], tail(rp$month, 1), 1/freq) ), by = 'month') %>% 
+        arrange(desc(-month)) %>% 
+        select(month, buyhold, index.hm, index.sop)
+      pfm.ts <- zoo(ts(pfm[-1], start = pfm$month[1], frequency = freq)) %>% na.omit
+      plot.ts(pfm.ts, plot.type = "single", col = 1:3, log = "y", lty = c(1, 2, 2), xlab = NULL, ylab = "Performance")
+      apply(pfm.ts, 2, max)
+      # text(x = end(time(pfm.ts)), y = apply(pfm.ts, 2, max), labels = round(apply(pfm.ts, 2, max), digits = 2), cex = 0.5, col = 1:3, pos = 4)
+      legend("topleft", legend = colnames(pfm.ts), lty = c(1,2,3), col = 1:3, cex = 0.8)
+      if (limit.opt == TRUE) {
+        title(main = substitute(paste(id, " (", limit.min, " <= ", omega, " <= ", limit.max, ")", sep = ""),
+                                list(id = id, limit.min = limit.min, limit.max = limit.max)))
+      } else {
+        title(main = paste(id, " (no restrictions)", sep = ""))
+      }
+    } 
+    
+    ## Figure-5 plotting section ---- 
+    if (limit.opt == FALSE) { # only return the 
+      jpeg(filename = paste("Figure3/figure3_", id, "_gamma3_", unlist(strsplit(i, split = ":"))[1], ".jpeg", sep = ""), width = 1000, height = 250)
+      ### optimal weights plot
+      weights_stock_trim <- weights_stock %>% 
+        filter(cumsum(!is.na(sop_simple)) > 0) 
+      par(mfrow = c(1,2))
+      par(mar = c(3, 4, 1, 1))
+      ### optimal weights plot
+      plot.ts(ts(weights_stock_trim$sop_simple, start = weights_stock_trim$month[1], frequency = freq) %>%
+              window(start = 1986), xlab = NULL, ylab = NULL, cex.main = 0.8, las = 1)
+      title(ylab = "Optimal Weights", line = 2.5)
+      legend("topright", legend = id, bty = "n")
+      lines(ts(weights_stock_trim$hist_mean, start = weights_stock_trim$month[1], frequency = freq), col = 1, lty = 2)
+      abline(h = c(0, 1), col = "greY50", lty = 3)
+      legend("bottomright", legend = c("SOP", "HM"), col = 1, lty = c(1,2), cex = 0.8, bty = 'n')
+      
+      ### performance plot
+      par(mar = c(3, 4, 1, 1))
+      plot.ts(pfm.ts %>% log, plot.type = "single", col = 1, log = "", lty = 1:3,
+              xlab = NULL, ylab = "", cex.main = 0.8, las = 1)
+      title(ylab = "Log Performance Index", line = 2)
+      legend("bottomright", legend = colnames(pfm.ts), lty = 1:3, col = 1, cex = 0.8, bty = 'n')
+      
+      dev.off()
+      par(mfrow = c(1,1))
+    }
+    
+    ## TABLE-4 Sharpe ratio and Sharpe ratio gains----
+    excess_returns <- rp # store the excess returns
+    for (mu in c("r", "hist_mean", "sop_simple", ratio_names, "buy_hold")) {
+      excess_returns[[mu]] <- excess_returns[[mu]] - excess_returns[["Rfree"]]
+    } # constructing the excess returns of the portfolio(s)
+    names(excess_returns)
+    table4.mean <- apply(na.omit(excess_returns)[-1], 2, FUN = function(x) mean(x, na.rm = T))
+    table4.sd <- apply(na.omit(excess_returns)[-1], 2, FUN = function(x) sd(x, na.rm = T)) # variance estimation is the same as in the CEGs. 
+    table4.sr <- table4.mean / table4.sd # get the Sharpe ratio
+    table4.dt <- cbind.data.frame(mean = table4.mean,
+                                  sd = table4.sd,
+                                  SR = table4.sr,
+                                  SR_annualised = table4.sr * sqrt(freq),
+                                  SRG_annualised = (table4.sr - table4.sr["hist_mean"]) * sqrt(freq))
+    table4.dt
+    TABLE4[[id]] <- table4.dt
+    
+    table4.dt <- round(table4.dt, digits = 6)
+    table4.dt$rowname <- rownames(table4.dt)
+    table4.dt$portname <- id
+    table4.dt$type <- i 
+    table4.df <- rbind.data.frame(table4.df, table4.dt) 
+    # assign(paste("table4.df_", i, sep = ""), table4.df)
+    
+  }
+  cat('\n')
+} 
+```
+
+## Table 3 - Certaint equivalent gains
+
+#### Trading Strategies: certaint equivalent gains
+
+This table shows the out-of-sample portfolio choice results at `r freq_name(freq = freq)` frequencies from predictive regressions and the SOP method. The trading strategy for each portfolio is designed by optimally allocating funds between the risk-free asset and the corresponding risky portfolio. The certainty equivalent return is $\overline{rp} - \frac{1}{2} \gamma \hat{\sigma}_{rp}^{2}$ with a risk-aversion coefficient $\gamma = 3$. The annualised certainty equivalent gain (**in percentage**) is the `r freq_name(freq = freq)` certainty equivalent gain multiplied by the corresponding frequency (e.g. 12 for monthly data).
+
+```{r table3.df, echo=T}
+dt <- table3.df %>%
+  filter(rowname %in% c(ratio_names, "sop_simple", "buy_hold")) %>%
+  select(CEGs_annualised, rowname, portname, type)
+dt_present <- NULL
+
+for (t in unique(dt$type)) {
+  dt_adjusted <- dt %>% filter(type == t) %>% 
+    .$CEGs_annualised 
+  
+    dt_present <- rbind.data.frame(dt_present, 
+               as.data.frame(matrix(dt_adjusted, byrow = F, nrow = length(unique(dt$rowname)), ncol = length(unique(dt$portname)))) %>%
+              `colnames<-`(unique(dt$portname)) %>%  
+               mutate(Variable = unique(dt$rowname), 
+               type = t))
+}
+
+table3.dfs <- dt_present
+gt(table3.dfs, rowname_col = "Variable", groupname_col = "type") %>%
+  tab_header(title = "Table 3 - Trading Strategies: certainty equivalent gains",
+             subtitle = paste(str_to_title(freq_name(freq = freq)), " data starts from ", first(data_decompose$month) + k/freq, " and ends in ", last(data_decompose$month), ".", sep = "")) %>%
+  fmt_percent(columns = 1:length(unique((dt$portname))), decimals = 2)
+```
+
+## Table 4 - Sharpe ratio Gains
+
+#### Trading Strategies: Sharpe ratio Gains
+
+This table presents the Sharpe ratio of the out-of-sample performance of trading strategies, allocating funds between risk-free and risky assets for each portfolio. The annualised Sharpe ratio is generated by multipling the `r freq_name(freq = freq)` Sharpe ratio by square root of the corresponding frequency (e.g. $\sqrt{12}$ for monthly data).
+
+```{r table4.output, echo=T}
+dt <- table4.df %>%
+  filter(rowname %in% c(ratio_names, "sop_simple", "buy_hold")) %>%
+  select(SRG_annualised, rowname, portname, type)
+
+dt_present <- NULL
+for (t in unique(dt$type)) {
+  dt_adjusted <- dt %>% filter(type == t) %>% 
+    .$SRG_annualised 
+  
+    dt_present <- rbind.data.frame(dt_present, 
+               as.data.frame(matrix(dt_adjusted, byrow = F, nrow = length(unique(dt$rowname)), ncol = length(unique(dt$portname)))) %>%
+              `colnames<-`(unique(dt$portname)) %>%  
+               mutate(Variable = unique(dt$rowname), 
+               type = t))
+}
+
+table4.dfs <- dt_present
+gt(table4.dfs, rowname_col = "Variable", groupname_col = "type") %>%
+  tab_header(title = "Table 4 - Trading Strategies: Sharpe ratio gains", 
+             subtitle = paste(str_to_title(freq_name(freq = freq)), " data starts from ", first(data_decompose$month) + k/freq, " and ends in ", last(data_decompose$month), ".", sep = "")) %>%
+  fmt_number(columns = 1:length(unique((dt$portname))), decimals = 4) 
+```
+
+## Figure 6 - Sensitivity of Certainty Equivalent Gains relative to Risk-Aversion level
+
+This figure presents the out-of-sample portfolio choice results at monthly frequency from bivariate predictive regressions and the SOP method with different levels of risk-aversion. To show that our previous results hold with respect to investors with different levels of risk aversion, we evaluate the changes in certainty equivalent gains with respect to the changes in the level of risk-aversion. The results of the trading strategy reported here are without trading restrictions (as in Table 5), allocating funds between the risk-free asset and the risky equity portfolio. The portfolio choice results are evaluated in the certainty equivalent return with relative risk-aversion coefficient $\gamma$, with $\gamma \in \{$ `r seq(from = 0.5, to = 5, by = 0.5)` $\}$. Risky equity portfolios include the market portfolio and six size and book-to-market equity sorted portfolios, BH, BM, BL, SH, SM and SL. The annualised certainty equivalent gain is the monthly certainty equivalent gain multiplied by twelve. The sample period is from February 1966 to December 2019 and the out-of-sample period starts in March 1986.
+
+```{r figure6.code, echo=T}
+#### create the folder storing the figure 2
+dir.create(file.path(getwd(), "Figure2")) 
+
+## 8. calculate the CEGs ----
+TABLE3_2 <- data.frame(matrix(nrow = 0, ncol = 0)) # for the CEGs with different risk-averse coefficients.
+
+### 8.1(new) CEGs with different risk-averse coefficients ----
+### This part will be recorded in TABLE3_2.
+for (id in names(all_predictions)) { # the sensitivity analysis of CEGs wrt. risk-averse coefficient
+  print(id); timestamp()
+  all_predictions.dt <- all_predictions[[id]] # read corresponding data
+  
+  var.s <- rep(NA_real_, length(all_predictions.dt$r))
+  for (t in 1:(length(var.s) - 1)) {
+    var.s[t+1] <- var(all_predictions.dt$r[1:t])
+  }
+  all_predictions.dt$var.s <- var.s # historical sample variance
+  all_predictions.dt <- all_predictions.dt %>%
+    left_join(RF, by = "month") %>%
+    rename(Rfree = t30ret) %>% # include the risk-free rate
+    mutate(Rfree = lag(Rfree)) # choose the lag of that rate
+  
+  ## record the annualised CEG (certainty equivalent gains)
+  table3.ceg_a <- c()
+  
+  for (risk.coef in seq(from = 0.5, to = 5, by = 0.5)) { # for different level of risk averse
+    
+    ## obtain the optimal weights on risky portfolios
+    weights_stock <- all_predictions.dt
+    for (mu in c("r", "hist_mean", "sop_simple")) {
+      weights_stock[[mu]] <- (exp(weights_stock[[mu]]) - 1 - weights_stock[["Rfree"]]) / (risk.coef * weights_stock[["var.s"]])
+    }
+    
+    ## calculate OOS trading performance
+    ## using upper and lower boundaries
+    rp <- all_predictions.dt %>%
+      select(month, r, Rfree) %>%
+      mutate(r = exp(r) - 1) # convert back to simple returns
+    limit.opt = F # the option to set limit or not
+    limit.max <- 1.0 # the upper bound of the portfolio weight
+    limit.min <- 0 # the lower bound of the portfolio weight
+    for (mu in c("hist_mean", "sop_simple")) {
+      w <- weights_stock[[mu]]
+      if (limit.opt == TRUE) { # whether to pose a upper-lower bound
+        w[w > limit.max & !is.na(w)] <- limit.max
+        w[w < limit.min & !is.na(w)] <- limit.min
+      }
+      rp[[mu]] <- w * rp$r + (1 - w) * rp$Rfree # calculate the portfolio returns
+    } # 'rp' has the risky-rf trading portfolio returns
+    table3.mean <- apply(na.omit(rp[-1]), 2, mean)
+    table3.var <- apply(na.omit(rp[-1]), 2, var)
+    table3.cer <- (table3.mean - 1/2 * risk.coef * table3.var) # certainty equivalent returns
+    table3.ceg <- (table3.cer - table3.cer["hist_mean"]) * freq # annualised certainty equivalent gains
+    table3.ceg_a <- c(table3.ceg_a, table3.ceg[['sop_simple']]) # store the annualised CEGs values
+  }
+  # store the annualised CEGs for the same portfolio with different risk-averse coefficients.
+  TABLE3_2 <- rbind.data.frame(TABLE3_2, table3.ceg_a)
+}
+colnames(TABLE3_2) <- seq(from = 0.5, to = 5, by = 0.5)
+rownames(TABLE3_2) <- names(all_predictions)
+write.csv(TABLE3_2, file = "table3_2.csv")
+
+### draw line graphs for these and show the sensitivity.
+dt_3.2 <- (TABLE3_2 * 100) %>% # convert to in percentage
+  as.matrix() %>%
+  c() %>%
+  cbind.data.frame(rep(seq(0.5, 5, by = 0.5), each = length(names(all_predictions)) )) %>%
+  cbind.data.frame(rep(names(all_predictions), times = length(seq(0.5, 5, by = 0.5))) ) 
+colnames(dt_3.2) <- c("CEGs", "Risk_coef", "Portfolios")
+# dt_3.2 # this is the dataset
+
+jpeg(filename = "Figure2/figure2.jpeg", width = 700, height = 500)
+y_range <- c(floor(min(dt_3.2$CEGs)), ceiling(max(dt_3.2$CEGs)))
+ggplot(dt_3.2, aes(x = Risk_coef, y = CEGs, group = Portfolios)) +
+  geom_point(shape = 4) +
+  geom_line(aes(linetype = Portfolios)) + 
+  scale_y_continuous(breaks = seq(y_range[1], y_range[2], by = ifelse(diff(y_range) > 25, 10, 5) ), limits = y_range) +
+  # scale_y_continuous(breaks = seq(round(min(dt_3.2$CEGs)) - 5, round(max(dt_3.2$CEGs)) + 5, by = 10), limits = c(-40, 20)) +
+  ylab(label = "Annualised Certainty Equivalent Gains (in %)") + 
+  xlab(label = "Risk-aversion Coefficient") + 
+  theme_linedraw()
+dev.off()
+```
+
+## Table 5 - MSPE-adjusted Statistic
+
+#### MSPE-adjusted Statistic
+
+This table presents the MSEP-adjusted Statistics, evaluating the statistical significance of the out-of-sample R-squared statistics of each model in the corresponding portfolio.
+
+> See Rapach et al., (2010) and Clark and West (2007) for the detailed procedure.
+
+```{r table5.code, include=T, echo=FALSE}
+# TABLE-5. different tables OOS R-square ----
+TABLE5 <- list()
+
+## (3*) repeat for each portfolio ----
+c <- 0
+for (id in c(market.names, data.names)) {
+  c <- c + 1
+  print(id); print(id.names[c])
+  timestamp()
+  
+  ## 1. read the data ----
+  data_nyse <- read.csv(id) %>% 
+    as.tbl() %>%
+    mutate(month = as.yearmon(month)) %>%
+    filter(month >= start.ym) %>% # start from "Dec 1965"
+    select(month, r = vwret, P = Index, E = E12, D = D12) %>%
+    mutate(DP = D / P, # construct predictors
+           PE = P / E,
+           EP = E / P,
+           EY = E / lag(P), # earnings yield
+           DY = D / lag(P), # dividend yield
+           Payout = D / E) # payout ratios
+  
+  ## 2. return decomposition ----
+  k = freq * 20 # set a 20-year rolling window (total k periods.)
+  
+  data_decompose <- data_nyse %>% # also try PD ratio replacing PE.
+    mutate(r = r, # cts returns (has already being the log return in row 95)
+           gm = log(PE) - lag(log(PE)), # multiple expansion rate
+           ge = log(E) - lag(log(E)), # earnings growth rate
+           # mu_ge0 = (log(E) - lag(log(E), k)) / k,
+           dp = log(1 + DP/freq)) %>% 
+    na.omit() %>% 
+    left_join(select(data_nyse, month, Ek = E) %>% mutate(month = month + k/freq), by = 'month' ) %>%
+    mutate(mu_ge0 = (log(E) - log(Ek)) / k ) 
+  
+  ## 3. SOP predictions ---- 
+  if (nrow(data_decompose) > k) {
+    data_pred <- data_decompose %>%
+      select(month, r, gm, ge, dp, mu_ge0) %>%
+      mutate(mu_gm = 0,
+             mu_ge1 = rollmeanr(ge, k, fill = NA_real_), # rolling mean 
+             mu_ge2 = c(rep(NA_real_, (k-1)), cummean(ge)[k:length(ge)]), # recursive mean
+             mu_ge3 = cummean(ge), # recursive mean from the beginning 
+             a_DK1 = rollmeanr(r - dp, k, fill = NA_real_), # methods Eq (14/15) by DK 
+             a_DK2 = cummean(r - dp), # methods Eq (14/15) by DK 
+             mu_dp = dp,
+             mu_sop = mu_gm + mu_ge0 + mu_dp) %>% # the predictor > see note 2.
+      mutate(sop_simple = lag(mu_sop), # conditional predictions
+             hist_mean = lag(cummean(r)) ) # historical mean predictions
+    
+  ### 3.2 constrained SOP predictions ----- 
+    constrained_sop2 <- constrained_sop <- rep(NA_real_, nrow(data_decompose)) 
+    for (t in (k+2):nrow(data_decompose)) {
+      ## based on the Eq (14/15) in F-SC (2011) 
+      x.IS <- data_decompose$dp[1:(t-2)] 
+      y.IS <- data_decompose$r[2:(t-1)] 
+      intercept <- data_pred$mu_ge1[t-1] #?
+      y <- y.IS - intercept 
+      data.IS <- data.frame(y, x.IS)
+      
+      model_constrained <- lm(y ~ x.IS - 1 + offset(1*x.IS), data = data.IS)
+      model.IS <- glm(y ~ x.IS - 1, data = data.IS, family = gaussian(link = "identity"), offset = -1*x.IS)
+      
+      x.new <- data_decompose$dp[t-1] 
+      y.pred <- predict.glm(model.IS, newdata = data.frame(x.IS = x.new), type = "response")
+      y.pred_manual <- coef(model.IS) * x.new 
+      constrained_sop[t] <- y.pred + intercept # store the prediction
+      constrained_sop2[t] <- y.pred_manual + intercept # store the prediction
+    }
+    data_pred$sop_constrained <- constrained_sop
+    data_pred$sop_constrained2 <- constrained_sop2
+  
+  } else {
+    data_pred <- data_decompose %>%
+      select(month, r, gm, ge, dp, mu_ge0) %>%
+      mutate(mu_sop = NA, 
+             sop_simple = NA, # conditional predictions
+             hist_mean = lag(cummean(r)) ) # historical mean predictions
+    
+    data_pred$sop_constrained2 <- data_pred$sop_constrained <- NA
+  }
+  
+  ## 4. OOS R2 and MSE-F ----
+  ### build the function for the bootstrap
+  MSPE.adj <- function(data, actual, cond, uncond) {
+    ## clean and reorganise the data
+    ports.dt <- data %>%
+      select(month, actual = actual, cond = cond, uncond = uncond)
+    
+    ports.dt_narm <- ports.dt %>% # select(-x) %>% 
+        filter(!is.na(actual) & !is.na(cond) & !is.na(uncond)) %>% 
+        # na.omit() %>%
+        mutate(error_A = actual - cond,
+               error_N = actual - uncond,
+               Cuml_MSE_A = cummean(error_A ^ 2),
+               Cuml_MSE_N = cummean(error_N ^ 2),
+               Cuml_OOS.rsquared = 1 - Cuml_MSE_A / Cuml_MSE_N,
+               Cum_SSE = cumsum(error_N ^2 - error_A ^ 2) ) %>% 
+        right_join(data.frame(month = seq(.$month[1], end.ym - 1/12, 1/freq) ), by = 'month') %>% 
+        arrange(desc(-month))
+    MSE_A <- mean(ports.dt_narm$error_A ^ 2, na.rm = T)
+    MSE_N <- mean(ports.dt_narm$error_N ^ 2, na.rm = T)
+    OOS_r.squared <- 1 - MSE_A / MSE_N # out-of-sample R square
+    
+    f <- (ports.dt_narm$actual - ports.dt_narm$uncond) ^ 2 -
+      ( (ports.dt_narm$actual - ports.dt_narm$cond) ^ 2 -
+          (ports.dt_narm$uncond - ports.dt_narm$cond) ^ 2)
+    mspe.stat <- t.test(f, alternative = "greater", mu = 0)
+    mspe_t <- mspe.stat$statistic # MSPE-adjusted statistic
+    mspe_pvalue <- mspe.stat$p.value # the p value
+    
+    result <- cbind.data.frame(OOS_r.squared, mspe_t, mspe_pvalue)
+    rownames(result) <- cond
+    return(result)
+  }
+  sop.mspe <- MSPE.adj(data = data_pred, actual = "r", cond = "sop_simple", uncond = "hist_mean")
+  rownames(sop.mspe) <- "SOP"
+  
+  ## 5. univariate predictive regressions ----
+  table5.uni_predictors <- data.frame()
+  for (predictor in ratio_names) {
+    ## construct conditional & unconditional predictions
+    data_univariate <- data_decompose %>%
+      select(month, r, predictor) %>%
+      mutate(hist_mean = lag(cummean(r)),
+             x = lag(get(predictor)) %>% log)
+    
+    ## OOS recursive window predictions
+    k <- k # the starting in-sample data
+    con_pred = rep(NA_real_, nrow(data_univariate))
+    for (t in (k+2):nrow(data_univariate)) {
+      x.IS <- data_univariate$x[2:(t-1)]
+      y.IS <- data_univariate$r[2:(t-1)]
+      reg.IS <- lm(y.IS ~ x.IS)
+      
+      x.new <- data_univariate$x[t]
+      y.pred <- predict(reg.IS, newdata = data.frame(x.IS = x.new))
+      con_pred[t] <- y.pred # store the prediction
+    }
+    data_univariate$con_pred <- con_pred
+    data_univariate
+    
+    ## generate MSPE-adj stat
+    univariate.mspe <- MSPE.adj(data = data_univariate, actual = "r", cond = "con_pred", uncond = "hist_mean")
+    rownames(univariate.mspe) <- predictor
+    
+    ## store the results for all predictors
+    table5.uni_predictors <- rbind.data.frame(table5.uni_predictors, univariate.mspe)
+  }
+  table5.uni_predictors
+  
+  ## 6. statistics summary ----
+  table5 <- rbind.data.frame(table5.uni_predictors, sop.mspe)
+  if ("mspe_pvalue" %in% colnames(table5)) {
+    table5$"" <- ifelse(table5$mspe_pvalue <= 0.01, "***", ifelse(table5$mspe_pvalue <= 0.05, "**", ifelse(table5$mspe_pvalue <= 0.1, "*", "")))
+  }
+  table5
+  TABLE5[[id.names[c]]] <- table5
+}
+```
+
+```{r table5.output, echo=T}
+table5.df <- data.frame()
+for (port in names(TABLE5)) {
+  pt <- TABLE5[[port]]
+  pt$rowname <- rownames(pt)
+  pt$portname <- port
+  colnames(pt)[4] <- "star"
+  table5.df <- rbind.data.frame(table5.df, pt)
+}
+
+table5.output <- gt(table5.df, rowname_col = "rowname", groupname_col = "portname") %>%
+  fmt_percent(columns = c(OOS_r.squared, mspe_pvalue), decimals = 2) %>%
+  fmt_number(columns = c(mspe_t), decimals = 4) %>%
+  tab_header(title = "Table 5 - MSPE-adjusted Statistic",
+             subtitle = paste(str_to_title(freq_name(freq = freq)), " data starts from ", first(data_decompose$month) + k/freq, " and ends in ", last(data_decompose$month), ".", sep = ""))
+
+table5.output
+```
+
+## Appendix D
+
+#### Table D1 - annualised certainty equivalent returns
+
+```{r tableD1.df, echo=T}
+dt <- table3.df %>% 
+  # filter(rowname %in% c(ratio_names, "sop_simple")) %>%
+  select(CERs_annualised, rowname, portname, type)
+
+tableD1.dfs <- pivot_wider(dt, names_from = portname, values_from = CERs_annualised ) 
+gt(tableD1.dfs, rowname_col = "Variable", groupname_col = "type") %>%
+  tab_header(title = "Table D1 - Trading Strategies: certainty equivalent returns",
+             subtitle = paste(str_to_title(freq_name(freq = freq)), " data starts from ", first(data_decompose$month) + k/freq, " and ends in ", last(data_decompose$month), ".", sep = "")) %>%
+  fmt_percent(columns = 3:ncol(tableD1.dfs), decimals = 2)
+```
+
+#### Table D2 - annualised Sharpe ratios
+
+```{r tableD2.output, echo=T}
+dt <- table4.df %>%
+  # filter(rowname %in% c(ratio_names, "sop_simple")) %>%
+  select(SR_annualised, rowname, portname, type)
+
+tableD2.dfs <- pivot_wider(dt, names_from = portname, values_from = SR_annualised ) 
+gt(tableD2.dfs, rowname_col = "Variable", groupname_col = "type") %>%
+  tab_header(title = "Table D2 - Trading Strategies: Sharpe ratio", 
+             subtitle = paste(str_to_title(freq_name(freq = freq)), " data starts from ", first(data_decompose$month) + k/freq, " and ends in ", last(data_decompose$month), ".", sep = "")) %>%
+  fmt_number(columns = 3:ncol(tableD2.dfs), decimals = 4) 
+```
+
+## Appendix E - Binary Trading Strategies - Certainty Equivalent Gains and Sharpe Ratios
+
+### Trading Performance {.tabset}
+
+```{r figureE.output, echo=T, results='asis'}
+## 8. calculate the CEGs ----
+TABLE3E <- list()
+TABLE4E <- list()
+
+table3E.df <- data.frame()
+table4E.df <- data.frame()
+
+##
+risk.coef <- 3 # the risk-aversion coefficient
+for (id in names(all_predictions)) {
+  all_predictions.dt <- all_predictions[[id]] %>% # read corresponding data
+    right_join(data.frame(month = seq(head(.$month, 1), tail(.$month, 1), 1/freq) ), by = 'month') %>% 
+    arrange(desc(-month))
+  
+  cat('\n')
+  cat('#### ', id, '   \n') 
+  
+  var.s <- rep(NA_real_, length(all_predictions.dt$r))
+  for (t in 1:(length(var.s) - 1)) {
+    var.s[t+1] <- var(all_predictions.dt$r[1:t], na.rm = T) # calculate variance estimation
+  }
+  all_predictions.dt$var.s <- var.s # historical sample variance
+  all_predictions.dt <- all_predictions.dt %>%
+    left_join(RF, by = "month") %>%
+    rename(Rfree = t30ret) %>% # include the risk-free rate
+    mutate(Rfree = lag(Rfree)) # choose the lag of that rate
+  
+  ## obtain the optimal weights on risky portfolios
+  weights_stock <- all_predictions.dt
+  for (mu in c("r", "hist_mean", "sop_simple", ratio_names)) {
+    weights_stock[[mu]] <- (exp(weights_stock[[mu]]) - 1 - weights_stock[["Rfree"]]) / (risk.coef * weights_stock[["var.s"]])
+  } ## calculate the optimal weights
+  
+  ## 8.1 calculate OOS trading performance ----
+  ## using upper and lower boundaries
+  rp <- all_predictions.dt %>%
+    select(month, r, Rfree) %>%
+    mutate(r = exp(r) - 1) # change from the log return back to the simple return
+  candidates <- list("Panel D: Binary Trading" = list("B", 1.5, -0.5))
+  for (i in names(candidates)) {
+    limit.para <- candidates[[i]]
+    limit.opt =  limit.para[[1]] # the option to set limit or not
+    limit.max <- limit.para[[2]] # the upper bound of the portfolio weight
+    limit.min <- limit.para[[3]] # the lower bound of the portfolio weight
+    
+    for (mu in c("hist_mean", "sop_simple", ratio_names)) {
+      w <- weights_stock[[mu]]
+      if (limit.opt == TRUE) { # whether to pose a upper-lower bound
+        w[w > limit.max & !is.na(w)] <- limit.max
+        w[w < limit.min & !is.na(w)] <- limit.min
+      } else if (limit.opt == "B") { # if it is binary trading 
+        w[w >= 0 & !is.na(w)] <- limit.max
+        w[w < 0 & !is.na(w)] <- limit.min
+      }
+      rp[[mu]] <- w * rp$r + (1 - w) * rp$Rfree # calculate the portfolio returns
+      weights_stock[[mu]] <- w 
+    } # 'rp' has the risky+rff trading portfolio returns
+    rp.na.omit <- na.omit(rp)
+    table3.mean <- apply((rp.na.omit[-1]), 2, FUN = function(x) mean(x, na.rm = T))
+    table3.var <- apply((rp.na.omit[-1]), 2, FUN = function(x) var(x, na.rm = T)) 
+    weights_stock_trim <- weights_stock %>% 
+      filter(cumsum(!is.na(sop_simple)) > 0) 
+    table3.percentageLong <- apply(weights_stock_trim[names(table3.mean)], 2, FUN = function(x) mean(x>=0, na.rm = T))
+    table3.cer <- table3.mean - 1/2 * risk.coef * table3.var # certainty equivalent returns 
+    table3.dt <- cbind.data.frame(mean = table3.mean, 
+                                  variance = table3.var, 
+                                  CERs = table3.cer, 
+                                  CERs_annualised = table3.cer * freq,
+                                  CEGs_annualised = (table3.cer - table3.cer["hist_mean"]) * freq, 
+                                  ProportionLong = table3.percentageLong)
+    table3.dt
+    TABLE3E[[id]] <- table3.dt
+    
+    table3.dt <- round(table3.dt, digits = 6)
+    table3.dt$rowname <- rownames(table3.dt)
+    table3.dt$portname <- id
+    table3.dt$type <- i
+    table3E.df <- rbind.data.frame(table3E.df, table3.dt) # for forming tables
+    # assign(paste("table3E.df_", i, sep = ""), table3E.df)
+    
+    ## TABLE-4 Sharpe ratio and Sharpe ratio gains----
+    excess_returns <- rp # store the excess returns
+    for (mu in c("r", "hist_mean", "sop_simple", ratio_names)) {
+      excess_returns[[mu]] <- excess_returns[[mu]] - excess_returns[["Rfree"]]
+    } # constructing the excess returns of the portfolio(s)
+    names(excess_returns)
+    table4.mean <- apply(na.omit(excess_returns)[-1], 2, FUN = function(x) mean(x, na.rm = T))
+    table4.sd <- apply(na.omit(excess_returns)[-1], 2, FUN = function(x) sd(x, na.rm = T)) # variance estimation is the same as in the CEGs. 
+    table4.sr <- table4.mean / table4.sd # get the Sharpe ratio
+    table4.dt <- cbind.data.frame(mean = table4.mean,
+                                  sd = table4.sd,
+                                  SR = table4.sr,
+                                  SR_annualised = table4.sr * sqrt(freq),
+                                  SRG_annualised = (table4.sr - table4.sr["hist_mean"]) * sqrt(freq))
+    table4.dt
+    TABLE4E[[id]] <- table4.dt
+    
+    table4.dt <- round(table4.dt, digits = 6)
+    table4.dt$rowname <- rownames(table4.dt)
+    table4.dt$portname <- id
+    table4.dt$type <- i 
+    table4E.df <- rbind.data.frame(table4E.df, table4.dt) 
+    # assign(paste("table4E.df_", i, sep = ""), table4E.df)
+    
+  } 
+  
+  cat('\n')
+  
+  ## plot the weights
+  plot.ts(ts(weights_stock_trim$sop_simple, start = weights_stock_trim$month[1], frequency = freq) %>% window(start = 1986), xlab = NULL, ylab = NULL, main = substitute(paste("The optimal weights on the ", name, " portfolio with ", gamma, " = ", g, sep = ""), list(name = id, g = risk.coef)))
+  points(ts(weights_stock_trim$hist_mean, start = weights_stock_trim$month[1], frequency = freq), col = 2, lty = 3, cex = 0.5)
+  points(ts(weights_stock_trim$PE, start = weights_stock_trim$month[1], frequency = freq), col = 3, lty = 3, cex = 0.5)
+  abline(h = c(0, 1, 1.5), col = "greY50", lty = 3)
+  legend("bottomright", legend = c("sop_simple", "hist_mean", "PE"), col = 1:3, lty = c(1,3,4), cex = 0.8, bg="transparent")
+  
+  cat('\n') 
+} 
+```
+
+### Table E - Binary Trading
+
+```{r tableE.output, echo=T}
+dt <- table3E.df %>% 
+  select(rowname, portname, CERs_annualised, CEGs_annualised, ProportionLong, ) %>% 
+  left_join(select(table4E.df, rowname, portname, SRG_annualised), by = c('rowname', 'portname')) %>%
+  filter(rowname %in% c("hist_mean", "sop_simple", ratio_names) ) 
+
+dt_present <- NULL
+for (t in colnames(dt)[-c(1,2)]) {
+  
+  dt_present <- rbind.data.frame(dt_present, 
+               dt %>% 
+                 select(rowname, portname, t) %>% 
+                 pivot_wider(names_from = portname, 
+                             values_from = t) %>% 
+                 mutate(type = t)
+    )
+}
+
+tableE.dfs <- dt_present %>% 
+  filter(!(rowname == "hist_mean" & !(type %in% c("CERs_annualised", "ProportionLong")) ) )
+
+gt(tableE.dfs, rowname_col = "Variable", groupname_col = "type") %>%
+  tab_header(title = "Table E - Binary Trading Strategies - Certainty Equivalent Gains and Sharpe Ratios", 
+             subtitle = paste(str_to_title(freq_name(freq = freq)), " data starts from ", first(data_decompose$month) + k/freq, " and ends in ", last(data_decompose$month), ".", sep = "")) %>% 
+  fmt_percent(columns = 2:ncol(tableE.dfs), decimals = 2, rows = which(str_detect(tableE.dfs$type, pattern = "^CE"))) %>% 
+  fmt_percent(columns = 2:ncol(tableE.dfs), decimals = 2, rows = which(str_detect(tableE.dfs$type, pattern = "^Prop"))) %>% 
+  fmt_number(columns = 2:ncol(tableE.dfs), decimals = 2, rows = which(str_detect(tableE.dfs$type, pattern = "^SRG"))) 
+  # fmt_number(columns = 2:ncol(tableE.dfs), decimals = 4) 
+```
+
+## Table C6: Response Doc - Comment 6: Forecasts of Portfolio Returns: Sum-of-the-Parts Extensions
+
+-   From Table 2 We also include the SOP method with multiple growth regression w/o shrinkage. The results are presented in Table 2B below. Our main findings are not altered by this extension that the simple SOP method still provides the most robust OOS R2 among big-cap portfolios.
+
+```{r tableC6.output}
+## this table contains all OOS results (inc. SOP with multiple growth regression <.MGR> and shrinkage <.shrink>)
+all.table2 <- table2.df %>%
+  select(rowname, portname, OOS_r.squared, McCracken) %>%
+  left_join(table2.sop_mg.df, by = c("rowname", "portname"), suffix = c("", ".MGR")) %>%
+  select(rowname, portname, OOS_r.squared, McCracken, OOS_r.squared.MGR, McCracken.MGR) %>%
+  left_join(table2.sop_mgshrink.df, by = c("rowname", "portname"), suffix = c("", ".shrink")) %>%
+  select(rowname, portname, OOS_r.squared, McCracken, OOS_r.squared.MGR, McCracken.MGR, OOS_r.squared.shrink, McCracken.shrink)
+
+gt(all.table2, rowname_col = "rowname", groupname_col = "portname") %>%
+  tab_header(title = "Table 2B - Forecasts of portfolio returns",
+             subtitle = paste(freq_name(freq = freq), " data starts from ", first(data_decompose$month), " and ends in ", last(data_decompose$month), ".", sep = "")) %>%
+  sub_missing(missing_text = "") %>% 
+  # fmt_number(columns = c(1,3,5,7), decimals = 6, suffixing = TRUE) %>% # , scale_by = 100
+  fmt_percent(columns = c(1,3,5,7)) %>%
+  tab_footnote(footnote = "OOS_r.sqaured gives the OOS R2, OOS_r.squared.MGR (MRG) give the OOS R2 from the SOP with multiple growth regression using each predictor in the rowname, and OOS_r.squared.shrink (MGR with Shrinkage) is from the SOP with both multiple growth regression and shrinkage using each predictor in the rowname. *, **, *** represent the signifiance level at 10%, 5% and 1% with MSE-F stat and McCracken critical values.") %>%
+  cols_width( ## change column width
+    starts_with("OOS") ~ px(130),
+    starts_with("McCracken") ~ px(50),
+    everything() ~ px(100)
+  ) %>%
+  cols_hide(columns = c("OOS_r.squared.MGR", "McCracken.MGR")) %>%
+  cols_label( ## change colnames
+    OOS_r.squared.MGR = "MGR",
+    OOS_r.squared.shrink = "MGR with Shrinkage",
+    McCracken = "",
+    McCracken.MGR = "",
+    McCracken.shrink = ""
+  )
+
+gtsave(gt(all.table2, rowname_col = "rowname", groupname_col = "portname") %>%
+  tab_header(title = "Table 2B - Forecasts of portfolio returns",
+             subtitle = paste(freq_name(freq = freq), " data starts from ", first(data_decompose$month), " and ends in ", last(data_decompose$month), ".", sep = "")) %>%
+  # fmt_number(columns = c(1,3,5,7), decimals = 6, suffixing = TRUE) %>% # , scale_by = 100
+  fmt_percent(columns = c(1,3,5,7)) %>%
+  tab_footnote(footnote = "OOS_r.sqaured gives the OOS R2, OOS_r.squared.MGR (MRG) give the OOS R2 from the SOP with multiple growth regression using each predictor in the rowname, and OOS_r.squared.shrink (MGR with Shrinkage) is from the SOP with both multiple growth regression and shrinkage using each predictor in the rowname. *, **, *** represent the signifiance level at 10%, 5% and 1% with MSE-F stat and McCracken critical values.") %>%
+    cols_width( ## change column width
+    starts_with("OOS") ~ px(130),
+    starts_with("McCracken") ~ px(50),
+    everything() ~ px(100)
+  ) %>%
+  cols_label(
+    OOS_r.squared.MGR = "MGR",
+    OOS_r.squared.shrink = "MGR with Shrinkage",
+    McCracken = "",
+    McCracken.MGR = "",
+    McCracken.shrink = ""
+  ) %>%
+    cols_hide(columns = c("OOS_r.squared.MGR", "McCracken.MGR")),
+  filename = "TableC6.rtf")
+
+### Augmented SOP with shrinked multiple growth component: table2.sop_mgshrink.df # May 1, 2024 
+tablec6b.dt <- gt(pivot_wider(table2.sop_mgshrink.df %>% select(OOS_r.squared, rowname, portname, McCracken), names_from = portname, values_from = c(OOS_r.squared, McCracken))) %>%
+  cols_merge(
+    columns = c(OOS_r.squared_Market, McCracken_Market),
+    pattern = "{1}{2}"
+  ) %>%
+  cols_merge(
+    columns = c(OOS_r.squared_BH, McCracken_BH),
+    pattern = "{1}{2}"
+  ) %>%
+  cols_merge(
+    columns = c(OOS_r.squared_BM, McCracken_BM),
+    pattern = "{1}{2}"
+  ) %>%
+  cols_merge(
+    columns = c(OOS_r.squared_BL, McCracken_BL),
+    pattern = "{1}{2}"
+  ) %>%
+  cols_merge(
+    columns = c(OOS_r.squared_SH, McCracken_SH),
+    pattern = "{1}{2}"
+  ) %>%
+  cols_merge(
+    columns = c(OOS_r.squared_SM, McCracken_SM),
+    pattern = "{1}{2}"
+  ) %>%
+  cols_merge(
+    columns = c(OOS_r.squared_SL, McCracken_SL),
+    pattern = "{1}{2}"
+  )  %>%
+  cols_label(
+    OOS_r.squared_Market = "NYSE",
+    OOS_r.squared_BH = "BH", 
+    OOS_r.squared_BM = "BM",
+    OOS_r.squared_BL = "BL", 
+    OOS_r.squared_SH = "SH", 
+    OOS_r.squared_SM = "SM", 
+    OOS_r.squared_SL = "SL"
+  ) %>% 
+  fmt_percent(columns = c(2:8))
+
+gtsave(tablec6b.dt, filename = "TableC6b.rtf")
+
+tablec6a.dt <- gt(pivot_wider(table2.df %>% select(OOS_r.squared, rowname, portname, McCracken), names_from = portname, values_from = c(OOS_r.squared, McCracken))) %>%
+  cols_merge(
+    columns = c(OOS_r.squared_Market, McCracken_Market),
+    pattern = "{1}{2}"
+  ) %>%
+  cols_merge(
+    columns = c(OOS_r.squared_BH, McCracken_BH),
+    pattern = "{1}{2}"
+  ) %>%
+  cols_merge(
+    columns = c(OOS_r.squared_BM, McCracken_BM),
+    pattern = "{1}{2}"
+  ) %>%
+  cols_merge(
+    columns = c(OOS_r.squared_BL, McCracken_BL),
+    pattern = "{1}{2}"
+  ) %>%
+  cols_merge(
+    columns = c(OOS_r.squared_SH, McCracken_SH),
+    pattern = "{1}{2}"
+  ) %>%
+  cols_merge(
+    columns = c(OOS_r.squared_SM, McCracken_SM),
+    pattern = "{1}{2}"
+  ) %>%
+  cols_merge(
+    columns = c(OOS_r.squared_SL, McCracken_SL),
+    pattern = "{1}{2}"
+  )  %>%
+  cols_label(
+    OOS_r.squared_Market = "NYSE",
+    OOS_r.squared_BH = "BH", 
+    OOS_r.squared_BM = "BM",
+    OOS_r.squared_BL = "BL", 
+    OOS_r.squared_SH = "SH", 
+    OOS_r.squared_SM = "SM", 
+    OOS_r.squared_SL = "SL"
+  ) %>% 
+  fmt_percent(columns = c(2:8))
+
+gtsave(tablec6a.dt, filename = "TableC6a.rtf")
+
+## combine two table c6 into one: 
+gt(rbind(tablec6a.dt$`_data`, tablec6b.dt$`_data`)) %>% 
+  tab_row_group(
+    group = "Panel A: Univariate Predictive Regressions", 
+    rows = 1:nrow(tablec6a.dt$`_data`)
+  ) %>% 
+  tab_row_group(
+    group = "Panel B: Augmented SOP with Multiple Growth Regressions", 
+    rows = (nrow(tablec6a.dt$`_data`)+1):(nrow(tablec6a.dt$`_data`) + nrow(tablec6b.dt$`_data`))
+  ) %>% 
+  cols_merge(
+    columns = c(OOS_r.squared_Market, McCracken_Market),
+    pattern = "{1}{2}"
+  ) %>%
+  cols_merge(
+    columns = c(OOS_r.squared_BH, McCracken_BH),
+    pattern = "{1}{2}"
+  ) %>%
+  cols_merge(
+    columns = c(OOS_r.squared_BM, McCracken_BM),
+    pattern = "{1}{2}"
+  ) %>%
+  cols_merge(
+    columns = c(OOS_r.squared_BL, McCracken_BL),
+    pattern = "{1}{2}"
+  ) %>%
+  cols_merge(
+    columns = c(OOS_r.squared_SH, McCracken_SH),
+    pattern = "{1}{2}"
+  ) %>%
+  cols_merge(
+    columns = c(OOS_r.squared_SM, McCracken_SM),
+    pattern = "{1}{2}"
+  ) %>%
+  cols_merge(
+    columns = c(OOS_r.squared_SL, McCracken_SL),
+    pattern = "{1}{2}"
+  )  %>%
+  cols_label(
+    OOS_r.squared_Market = "NYSE",
+    OOS_r.squared_BH = "BH", 
+    OOS_r.squared_BM = "BM",
+    OOS_r.squared_BL = "BL", 
+    OOS_r.squared_SH = "SH", 
+    OOS_r.squared_SM = "SM", 
+    OOS_r.squared_SL = "SL"
+  ) %>%
+  tab_header(title = "Table C6 - Forecasts of Portfolio Returns: Sum-of-the-Parts Extensions", 
+             subtitle = paste(str_to_title(freq_name(freq = freq)), " data starts from ", first(data_decompose$month) + k/freq, " and ends in ", last(data_decompose$month), ".", sep = "")) %>% 
+  fmt_percent(columns = c(2:8))
+
+```
+
+## Data - Collect all tables into an xlsx file
+
+```{r data_collect, include=TRUE, echo=FALSE}
+list_table_names <- list("table1_summary" = table1,
+                         "table2_OOSR2" = table2.df,
+                         "table4_ceg" = table3.df,
+                         "table5_srg" = table4.df,
+                         "table6_mspe_t" = table5.df, 
+                         "tableE_binary_trading" = tableE.dfs, 
+                         "tableC6_multiple_growth" = rbind(tablec6a.dt$`_data`, tablec6b.dt$`_data`) # for comment 6 
+                         )
+
+write.xlsx(list_table_names, file = paste("Results_", 
+                                          str_split(str_split(params$port_file, pattern = "_", n =2)[[1]][2], pattern = "\\.")[[1]][1],
+                                          "_terciles.xlsx", sep = ""))
+
+## return return predictions in nominal returns - for SPA tests 
+#### the folder that store `predictions`
+file_id <- str_split(str_split(params$port_file, pattern = "_", n =2)[[1]][2], pattern = "\\.")[[1]][1]
+prediction_folder_name <- paste("prediction",  file_id, sep = "_")
+dir.create(file.path(getwd(), prediction_folder_name)) 
+#### the folder that store `first difference of predictions`
+firstdiff_folder_name <- paste("firstdiff",  file_id, sep = "_")
+dir.create(file.path(getwd(), firstdiff_folder_name))
+
+for (id in names(all_predictions)) {
+  all_predictions_nominal <- all_predictions.dt <- all_predictions[[id]] # read corresponding data
+  all_predictions_nominal <- exp(all_predictions.dt[, -1])-1 # convert log return to nominal return
+  all_predictions_firstdiff <- apply(all_predictions_nominal[, -1], 2, diff)
+  write.csv(all_predictions_nominal, file = paste(prediction_folder_name, "/", file_id, "_", id, "_pred.csv", sep = ""), row.names = F)
+  write.csv(all_predictions_firstdiff, file = paste(firstdiff_folder_name, "/", file_id, "_", id, "_firstdiff.csv", sep = ""), row.names = F)
+}
+
+## store results for value premium etc. > write.xlsx(list("bm" = table6_bm, "inv" = table6_inv, "op" = table6_op, "mom" = table6_mom), file = "Results_sz_premium_quintiles.xlsx", rowNames = TRUE)
+```
+
+## ------------------------
+
+## For Figures in the journal
+
+## Journal: Figure 1
+
+for picture: figure1jb.jpeg and figure1js.jpeg. 
+
+[Table 2 - Forecasts of portfolio returns] 
+
+```{r journal_fig1, echo=TRUE}
+#### create the folder storing the figure 3 
+dir.create(file.path(getwd(), "Figure1")) 
+
+jpeg(filename = paste("Figure1/figure1jb", ".jpeg", sep = ""), width = 1500*3, height = 800*3, res = 300)
+par(mfrow = c(2,3))
+for (method in colnames(Csse_all.ts)) { # for the big-cap group
+  par(mar = c(2.5, 4, 1.5, 1), cex.axis = 1.3)
+  CSSE_group.ts <- stats::ts.union(NYSE = CSSE.ls$NYSE[, method], # market benchmark
+                                    BH = CSSE.ls$BH[, method], # BH portfolio
+                                    BM = CSSE.ls$BM[, method], # BM
+                                    BL = CSSE.ls$BL[, method], # BL 
+                                    BL = CSSE.ls$BL[, method]  # BL 
+                                    ) 
+  
+  plot.ts(CSSE_group.ts, plot.type = "single", lty = 1:4, col = 1,
+          ylab = NULL, cex.main = 2, # main = method,
+          las = 1, lwd = 2, ylim = c(-0.02, 0.02))
+  legend("bottomleft", legend = colnames(CSSE_group.ts), col = 1,
+         lty = 1:4, cex = 1.5, bty = "n", lwd = 2)
+  legend("top", legend = method, cex = 2, bty = "n")
+}
+dev.off()
+
+jpeg(filename = paste("Figure1/figure1js", ".jpeg", sep = ""),
+     width = 1500*3, height = 800*3, res = 300)
+par(mfrow = c(2,3))
+for (method in colnames(Csse_all.ts)) { # for the small-cap group
+  par(mar = c(2.5, 4, 1.5, 1), cex.axis = 1.3)
+  CSSE_group.ts <- ts.union(NYSE = CSSE.ls$NYSE[, method], # market benchmark
+                            SH = CSSE.ls$SH[, method], # SH portfolio
+                            SM = CSSE.ls$SM[, method], # SM
+                            SL = CSSE.ls$SL[, method], # SL
+                            SL = CSSE.ls$SL[, method])  
+  
+  plot.ts(CSSE_group.ts, plot.type = "single", lty = 1:4, col = 1,
+          ylab = NULL, cex.main = 2, # main = method, 
+          las = 1, lwd = 2, ylim = c(range(CSSE_group.ts, na.rm = T)[1] * 1.1,
+                                     range(CSSE_group.ts, na.rm = T)[2] * 1.3))
+  legend("bottomleft", legend = colnames(CSSE_group.ts), col = 1,
+         lty = 1:4, cex = 1.5, bty = "n", lwd = 2)
+  legend("top", legend = method, cex = 2, bty = "n")
+}
+dev.off()
+par(mfrow = c(1,1))
+```
+
+## Journal: Figure 2
+
+[Figure 6 - Sensitivity of Certainty Equivalent Gains relative to Risk-Aversion level]
+
+## Journal: Figure 3
+
+Figures: Figure3/figure3_Market_gamma3_Panel A.jpeg, etc. 
+
+[Figure 5 - Trading Performance (with no trading restrictions)] 
+
+## ------------------------
+
+## Test Field
+
+```{r appendixD_test.output, echo=T, results='asis'}
+## 8. calculate the CEGs ----
+TABLE3 <- list()
+TABLE_test <- list()
+
+table3.df <- data.frame()
+
+##
+risk.coef <- 3 # the risk-aversion coefficient
+for (id in names(all_predictions)) {
+  all_predictions.dt <- all_predictions[[id]] %>% # read corresponding data
+    right_join(data.frame(month = seq(head(.$month, 1), tail(.$month, 1), 1/freq) ), by = 'month') %>% 
+    arrange(desc(-month))
+  
+  var.s <- rep(NA_real_, length(all_predictions.dt$r))
+  for (t in 1:(length(var.s) - 1)) {
+    var.s[t+1] <- var(all_predictions.dt$r[1:t], na.rm = T) # calculate variance estimation
+  }
+  all_predictions.dt$var.s <- var.s # historical sample variance
+  all_predictions.dt <- all_predictions.dt %>%
+    left_join(RF, by = "month") %>%
+    rename(Rfree = t30ret) %>% # include the risk-free rate
+    mutate(Rfree = lag(Rfree)) # choose the lag of that rate
+  
+  ## obtain the optimal weights on risky portfolios
+  weights_stock <- all_predictions.dt
+  for (mu in c("r", "hist_mean", "sop_simple", ratio_names)) {
+    weights_stock[[mu]] <- (exp(weights_stock[[mu]]) - 1 - weights_stock[["Rfree"]]) / (risk.coef * weights_stock[["var.s"]])
+  } ## calculate the optimal weights
+  
+  ## 8.1 calculate OOS trading performance ----
+  ## using upper and lower boundaries
+  rp <- all_predictions.dt %>%
+    select(month, r, Rfree) %>%
+    mutate(r = exp(r) - 1) # change from the log return back to the simple return
+  candidates <- list("Panel A: No Trading Restrictions" = list(F, 0, 0) )
+  for (i in names(candidates)) {
+    limit.para <- candidates[[i]]
+    limit.opt =  limit.para[[1]] # the option to set limit or not
+    limit.max <- limit.para[[2]] # the upper bound of the portfolio weight
+    limit.min <- limit.para[[3]] # the lower bound of the portfolio weight
+    
+    for (mu in c("hist_mean", "sop_simple", ratio_names)) {
+      w <- weights_stock[[mu]]
+      if (limit.opt == TRUE) { # whether to pose a upper-lower bound
+        w[w > limit.max & !is.na(w)] <- limit.max
+        w[w < limit.min & !is.na(w)] <- limit.min
+      }
+      rp[[mu]] <- w * rp$r + (1 - w) * rp$Rfree # calculate the portfolio returns
+    } # 'rp' has the risky+rff trading portfolio returns
+    
+    rp.na.omit <- na.omit(rp)
+    
+    table3.mean <- apply((rp.na.omit[-1]), 2, FUN = function(x) mean(x, na.rm = T))
+    table3.var <- apply((rp.na.omit[-1]), 2, FUN = function(x) var(x, na.rm = T))
+    table3.cer <- table3.mean - 1/2 * risk.coef * table3.var # certainty equivalent returns
+    
+    { ## examine the cumulative CERs 
+      ### cumulative mean 
+      table_test.mean <- apply((rp.na.omit[-1]), 2, FUN = function(x) cummean(x) )
+      ### cumulative variance  
+      table_test.var <- apply((rp.na.omit[-1]), 2, FUN = function(x) (cummean(x^2) - cummean(x)^2) * (1:length(x)) / ((1:length(x)) - 1) )
+      ### cumulative CERs 
+      table_test.cer <- table_test.mean - 1/2 * risk.coef * table_test.var 
+    }
+    
+    
+    table3.dt <- cbind.data.frame(mean = table3.mean, 
+                                  variance = table3.var, 
+                                  CERs = table3.cer, 
+                                  CERs_annualised = table3.cer * freq,
+                                  CEGs_annualised = (table3.cer - table3.cer["hist_mean"]) * freq)
+    table3.dt
+    TABLE3[[id]] <- table3.dt
+    TABLE_test[[id]] <- cbind.data.frame(rp.na.omit[1], table_test.cer)
+    
+    table3.dt <- round(table3.dt, digits = 6)
+    table3.dt$rowname <- rownames(table3.dt)
+    table3.dt$portname <- id
+    table3.dt$type <- i
+    table3.df <- rbind.data.frame(table3.df, table3.dt) # for forming tables
+    # assign(paste("table3.df_", i, sep = ""), table3.df)
+  }
+} 
+```
+
+```{r appendixD_test2.output, echo=T}
+colnames(TABLE_test$BM)
+ggplot(TABLE_test$BM, aes(x = month)) + 
+  geom_line(aes(y = hist_mean*100, col = "hist_mean")) + 
+  geom_line(aes(y = sop_simple*100, col = "sop_simple")) + 
+  labs(x = "", y = "monthly certainty equivalent returns (in %)", color = "Prediction") + 
+  scale_y_continuous(limits = c(max(0, min(TABLE_test$BM[-1])), 2)) + 
+  theme_bw()
+```
